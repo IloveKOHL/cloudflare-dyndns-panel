@@ -85,38 +85,49 @@ function getZones($apiToken) {
 }
 
 function getRecords($apiToken, $zoneId) {
-    $url = "https://api.cloudflare.com/client/v4/zones/$zoneId/dns_records?type=A";
-    $options = [
-        "http" => [
-            "header" => [
-                "Authorization: Bearer $apiToken",
-                "Content-Type: application/json"
-            ],
-            "method" => "GET"
-        ]
-    ];
+    $requestedType = strtoupper($_GET['record_type'] ?? 'ALL');
+    $types = $requestedType === 'AAAA' ? ['AAAA'] : ($requestedType === 'A' ? ['A'] : ['A', 'AAAA']);
+    $records = [];
     
-    $context = stream_context_create($options);
-    $result = @file_get_contents($url, false, $context);
-    
-    if (!$result) {
-        echo json_encode(['success' => false, 'error' => 'Network error while fetching records']);
-        return;
+    foreach ($types as $type) {
+        $url = "https://api.cloudflare.com/client/v4/zones/$zoneId/dns_records?type=$type";
+        $options = [
+            "http" => [
+                "header" => [
+                    "Authorization: Bearer $apiToken",
+                    "Content-Type: application/json"
+                ],
+                "method" => "GET"
+            ]
+        ];
+        
+        $context = stream_context_create($options);
+        $result = @file_get_contents($url, false, $context);
+        
+        if (!$result) {
+            echo json_encode(['success' => false, 'error' => 'Network error while fetching records']);
+            return;
+        }
+        
+        $response = json_decode($result, true);
+        
+        if (!$response['success']) {
+            $errors = isset($response['errors']) ? array_column($response['errors'], 'message') : ['Unknown error'];
+            echo json_encode(['success' => false, 'error' => implode(', ', $errors)]);
+            return;
+        }
+        
+        $records = array_merge($records, $response['result']);
     }
     
-    $response = json_decode($result, true);
-    
-    if (!$response['success']) {
-        $errors = isset($response['errors']) ? array_column($response['errors'], 'message') : ['Unknown error'];
-        echo json_encode(['success' => false, 'error' => implode(', ', $errors)]);
-        return;
+    if (!empty($records)) {
+        usort($records, function($a, $b) {
+            if ($a['name'] === $b['name']) {
+                return strcmp($a['type'], $b['type']);
+            }
+            return strcmp($a['name'], $b['name']);
+        });
     }
-    
-    // Sort records by name
-    $records = $response['result'];
-    usort($records, function($a, $b) {
-        return strcmp($a['name'], $b['name']);
-    });
     
     echo json_encode([
         'success' => true,

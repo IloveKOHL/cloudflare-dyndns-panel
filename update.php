@@ -9,7 +9,21 @@ function loadConfig() {
     if (!file_exists('config.json')) {
         return ['api_token' => '', 'domains' => []];
     }
-    return json_decode(file_get_contents('config.json'), true);
+    $config = json_decode(file_get_contents('config.json'), true);
+    if (!$config || !isset($config['domains']) || !is_array($config['domains'])) {
+        $config['domains'] = [];
+    }
+    if (!empty($config['domains'])) {
+        foreach ($config['domains'] as &$domain) {
+            if (!isset($domain['type'])) {
+                $domain['type'] = 'A';
+            } else {
+                $domain['type'] = strtoupper($domain['type']) === 'AAAA' ? 'AAAA' : 'A';
+            }
+        }
+        unset($domain);
+    }
+    return $config;
 }
 
 // Save configuration
@@ -17,17 +31,29 @@ function saveConfig($config) {
     return file_put_contents('config.json', json_encode($config, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
 }
 
-// Get current IP
-function getCurrentIP() {
-    $ip = @file_get_contents("https://api.ipify.org");
-    return $ip ?: false;
+// Get current IP for the requested DNS record type
+function getCurrentIP($type = 'A') {
+    $type = strtoupper($type) === 'AAAA' ? 'AAAA' : 'A';
+    $services = $type === 'AAAA'
+        ? ['https://api6.ipify.org', 'https://ipv6.icanhazip.com', 'https://v6.ident.me']
+        : ['https://api.ipify.org', 'https://ipv4.icanhazip.com', 'https://checkip.amazonaws.com'];
+    $flag = $type === 'AAAA' ? FILTER_FLAG_IPV6 : FILTER_FLAG_IPV4;
+    
+    foreach ($services as $service) {
+        $ip = @file_get_contents($service);
+        if ($ip && filter_var(trim($ip), FILTER_VALIDATE_IP, $flag)) {
+            return trim($ip);
+        }
+    }
+    
+    return false;
 }
 
 // Update DNS record
-function updateDNSRecord($apiToken, $zoneId, $recordId, $name, $ip, $proxied = false) {
+function updateDNSRecord($apiToken, $zoneId, $recordId, $name, $ip, $recordType = 'A', $proxied = false) {
     $url = "https://api.cloudflare.com/client/v4/zones/$zoneId/dns_records/$recordId";
     $data = [
-        "type" => "A",
+        "type" => $recordType,
         "name" => $name,
         "content" => $ip,
         "ttl" => 120,
@@ -56,11 +82,12 @@ function updateDNSRecord($apiToken, $zoneId, $recordId, $name, $ip, $proxied = f
 }
 
 // Log update
-function logUpdate($domain, $ip, $success, $error = '') {
+function logUpdate($domain, $ip, $recordType, $success, $error = '') {
     $logEntry = [
         'timestamp' => date('Y-m-d H:i:s'),
         'domain' => $domain,
         'ip' => $ip,
+        'record_type' => $recordType,
         'success' => $success,
         'error' => $error
     ];
@@ -80,13 +107,9 @@ function logUpdate($domain, $ip, $success, $error = '') {
     file_put_contents($logFile, json_encode($logs, JSON_PRETTY_PRINT));
 }
 
+
 $config = loadConfig();
 $results = [];
-$currentIP = getCurrentIP();
-
-if (!$currentIP) {
-    die("❌ Error: Could not determine current IP address");
-}
 
 if (empty($config['api_token'])) {
     die("❌ Error: No API token configured");
@@ -94,6 +117,8 @@ if (empty($config['api_token'])) {
 
 // Check if specific domain should be updated
 $specificDomain = isset($_GET['domain']) ? $_GET['domain'] : null;
+
+$domainsToProcess = [];
 
 if (isset($config['domains']) && !empty($config['domains'])) {
     foreach ($config['domains'] as $domain) {
@@ -107,34 +132,62 @@ if (isset($config['domains']) && !empty($config['domains'])) {
             continue;
         }
         
-        $response = updateDNSRecord(
-            $config['api_token'],
-            $domain['zone_id'],
-            $domain['record_id'],
-            $domain['name'],
-            $currentIP,
-            $domain['proxied']
-        );
-        
-        $success = $response['success'] ?? false;
-        $error = '';
-        
-        if (!$success && isset($response['errors'])) {
-            $error = implode(', ', array_column($response['errors'], 'message'));
-        }
-        
-        $results[] = [
-            'domain' => $domain['name'],
-            'success' => $success,
-            'error' => $error,
-            'proxied' => $domain['proxied']
-        ];
-        
-        // Log the update
-        logUpdate($domain['name'], $currentIP, $success, $error);
+        $domain['type'] = isset($domain['type']) && strtoupper($domain['type']) === 'AAAA' ? 'AAAA' : 'A';
+        $domainsToProcess[] = $domain;
     }
-} else {
-    die("❌ Error: No domains configured");
+}
+
+if (empty($domainsToProcess)) {
+    die("❌ Error: No matching domains configured");
+}
+
+$requiredTypes = [];
+foreach ($domainsToProcess as $domain) {
+    $requiredTypes[$domain['type']] = true;
+}
+
+$currentIPs = [];
+foreach (array_keys($requiredTypes) as $recordType) {
+    $ip = getCurrentIP($recordType);
+    if (!$ip) {
+        $label = $recordType === 'AAAA' ? 'IPv6' : 'IPv4';
+        die("❌ Error: Could not determine current $label address");
+    }
+    $currentIPs[$recordType] = $ip;
+}
+
+foreach ($domainsToProcess as $domain) {
+    $recordType = $domain['type'];
+    $ipValue = $currentIPs[$recordType];
+    
+    $response = updateDNSRecord(
+        $config['api_token'],
+        $domain['zone_id'],
+        $domain['record_id'],
+        $domain['name'],
+        $ipValue,
+        $recordType,
+        $domain['proxied']
+    );
+    
+    $success = $response['success'] ?? false;
+    $error = '';
+    
+    if (!$success && isset($response['errors'])) {
+        $error = implode(', ', array_column($response['errors'], 'message'));
+    }
+    
+    $results[] = [
+        'domain' => $domain['name'],
+        'type' => $recordType,
+        'ip' => $ipValue,
+        'success' => $success,
+        'error' => $error,
+        'proxied' => $domain['proxied']
+    ];
+    
+    // Log the update
+    logUpdate($domain['name'], $ipValue, $recordType, $success, $error);
 }
 ?>
 
@@ -271,8 +324,10 @@ if (isset($config['domains']) && !empty($config['domains'])) {
         </div>
 
         <div class="ip-info">
-            <h3>Current IP Address</h3>
-            <div class="ip"><?= htmlspecialchars($currentIP) ?></div>
+            <h3>Current IP Addresses</h3>
+            <?php foreach ($currentIPs as $type => $value): ?>
+                <p><strong><?= $type === 'AAAA' ? 'IPv6' : 'IPv4' ?>:</strong> <?= htmlspecialchars($value) ?></p>
+            <?php endforeach; ?>
         </div>
 
         <?php foreach ($results as $result): ?>
@@ -287,7 +342,7 @@ if (isset($config['domains']) && !empty($config['domains'])) {
                 
                 <?php if ($result['success']): ?>
                     <p><strong>Update successful!</strong></p>
-                    <p>IP address updated to <?= htmlspecialchars($currentIP) ?></p>
+                    <p>IP address updated to <?= htmlspecialchars($result['ip']) ?> (<?= htmlspecialchars($result['type']) ?>)</p>
                 <?php else: ?>
                     <p><strong>Update failed:</strong></p>
                     <p><?= htmlspecialchars($result['error']) ?></p>

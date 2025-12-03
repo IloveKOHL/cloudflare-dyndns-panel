@@ -28,22 +28,33 @@ function loadConfig() {
     if (!isset($config['api_token']) || !isset($config['domains'])) {
         return null;
     }
+    if (!is_array($config['domains'])) {
+        $config['domains'] = [];
+    } elseif (!empty($config['domains'])) {
+        foreach ($config['domains'] as &$domain) {
+            if (!isset($domain['type'])) {
+                $domain['type'] = 'A';
+            } else {
+                $domain['type'] = strtoupper($domain['type']) === 'AAAA' ? 'AAAA' : 'A';
+            }
+        }
+        unset($domain);
+    }
     
     return $config;
 }
 
-// Get current IP
-function getCurrentIP() {
-    $services = [
-        'https://api.ipify.org',
-        'https://ipv4.icanhazip.com',
-        'https://checkip.amazonaws.com',
-        'https://ipinfo.io/ip'
-    ];
+// Get current IP for a DNS record type
+function getCurrentIP($type = 'A') {
+    $type = strtoupper($type) === 'AAAA' ? 'AAAA' : 'A';
+    $services = $type === 'AAAA'
+        ? ['https://api6.ipify.org', 'https://ipv6.icanhazip.com', 'https://v6.ident.me']
+        : ['https://api.ipify.org', 'https://ipv4.icanhazip.com', 'https://checkip.amazonaws.com'];
+    $flag = $type === 'AAAA' ? FILTER_FLAG_IPV6 : FILTER_FLAG_IPV4;
     
     foreach ($services as $service) {
         $ip = @file_get_contents($service);
-        if ($ip && filter_var(trim($ip), FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        if ($ip && filter_var(trim($ip), FILTER_VALIDATE_IP, $flag)) {
             return trim($ip);
         }
     }
@@ -52,10 +63,10 @@ function getCurrentIP() {
 }
 
 // Update DNS record via Cloudflare API
-function updateDNSRecord($apiToken, $zoneId, $recordId, $name, $ip, $proxied = false) {
+function updateDNSRecord($apiToken, $zoneId, $recordId, $name, $ip, $recordType = 'A', $proxied = false) {
     $url = "https://api.cloudflare.com/client/v4/zones/$zoneId/dns_records/$recordId";
     $data = [
-        "type" => "A",
+        "type" => $recordType,
         "name" => $name,
         "content" => $ip,
         "ttl" => 120,
@@ -91,11 +102,12 @@ function updateDNSRecord($apiToken, $zoneId, $recordId, $name, $ip, $proxied = f
 }
 
 // Log update with timestamp
-function logUpdate($domain, $ip, $success, $error = '', $auto = true) {
+function logUpdate($domain, $ip, $recordType, $success, $error = '', $auto = true) {
     $logEntry = [
         'timestamp' => date('Y-m-d H:i:s'),
         'domain' => $domain,
         'ip' => $ip,
+        'record_type' => $recordType,
         'success' => $success,
         'error' => $error,
         'automatic' => $auto
@@ -120,18 +132,31 @@ function logUpdate($domain, $ip, $success, $error = '', $auto = true) {
 }
 
 // Check if IP has changed since last update
-function hasIPChanged($currentIP) {
-    $lastIPFile = 'last_ip.txt';
+function hasIPChanged($recordType, $currentIP) {
+    $recordType = strtoupper($recordType) === 'AAAA' ? 'AAAA' : 'A';
+    $storeFile = 'last_ip.json';
+    $legacyFile = 'last_ip.txt';
+    $data = [];
     
-    if (!file_exists($lastIPFile)) {
-        file_put_contents($lastIPFile, $currentIP);
-        return true;
+    if (file_exists($storeFile)) {
+        $content = file_get_contents($storeFile);
+        $decoded = json_decode($content, true);
+        if (is_array($decoded)) {
+            $data = $decoded;
+        }
+    } elseif (file_exists($legacyFile)) {
+        $legacyIp = trim(file_get_contents($legacyFile));
+        if ($legacyIp !== '') {
+            $data['A'] = $legacyIp;
+        }
+        @unlink($legacyFile);
     }
     
-    $lastIP = trim(file_get_contents($lastIPFile));
+    $previous = $data[$recordType] ?? null;
     
-    if ($lastIP !== $currentIP) {
-        file_put_contents($lastIPFile, $currentIP);
+    if ($previous !== $currentIP) {
+        $data[$recordType] = $currentIP;
+        file_put_contents($storeFile, json_encode($data, JSON_PRETTY_PRINT));
         return true;
     }
     
@@ -203,26 +228,6 @@ if (empty($config['api_token'])) {
     exit(1);
 }
 
-// Get current IP address
-echo "[" . date('Y-m-d H:i:s') . "] Getting current IP address...\n";
-$currentIP = getCurrentIP();
-
-if (!$currentIP) {
-    echo "[" . date('Y-m-d H:i:s') . "] ERROR: Could not determine current IP address\n";
-    echo "Tried multiple IP detection services, all failed.\n";
-    exit(1);
-}
-
-echo "[" . date('Y-m-d H:i:s') . "] Current IP: $currentIP\n";
-
-// Check if IP has changed (optimization)
-if (!hasIPChanged($currentIP)) {
-    echo "[" . date('Y-m-d H:i:s') . "] INFO: IP address unchanged, skipping update\n";
-    exit(0);
-}
-
-echo "[" . date('Y-m-d H:i:s') . "] IP address changed, updating DNS records...\n";
-
 // Check if domains are configured
 if (!isset($config['domains']) || empty($config['domains'])) {
     echo "[" . date('Y-m-d H:i:s') . "] WARNING: No domains configured\n";
@@ -232,32 +237,83 @@ if (!isset($config['domains']) || empty($config['domains'])) {
 $updateCount = 0;
 $errorCount = 0;
 $skippedCount = 0;
+$domainsToProcess = [];
 
-// Process each domain
+// Validate and collect enabled domains
 foreach ($config['domains'] as $domain) {
-    // Skip disabled domains
     if (!isset($domain['enabled']) || !$domain['enabled']) {
         echo "[" . date('Y-m-d H:i:s') . "] INFO: Skipping disabled domain: {$domain['name']}\n";
         $skippedCount++;
         continue;
     }
     
-    // Validate domain configuration
     if (!isset($domain['zone_id']) || !isset($domain['record_id']) || !isset($domain['name'])) {
         echo "[" . date('Y-m-d H:i:s') . "] ERROR: Invalid domain configuration for: " . ($domain['name'] ?? 'unknown') . "\n";
         $errorCount++;
         continue;
     }
     
-    echo "[" . date('Y-m-d H:i:s') . "] Updating {$domain['name']}...\n";
+    $domain['type'] = isset($domain['type']) && strtoupper($domain['type']) === 'AAAA' ? 'AAAA' : 'A';
+    $domainsToProcess[] = $domain;
+}
+
+if (empty($domainsToProcess)) {
+    echo "[" . date('Y-m-d H:i:s') . "] WARNING: No enabled domains to update\n";
+    exit($errorCount > 0 ? 1 : 0);
+}
+
+// Determine required record types
+$requiredTypes = [];
+foreach ($domainsToProcess as $domain) {
+    $requiredTypes[$domain['type']] = true;
+}
+
+$currentIPs = [];
+$typeChanges = [];
+
+foreach (array_keys($requiredTypes) as $recordType) {
+    $label = $recordType === 'AAAA' ? 'IPv6' : 'IPv4';
+    echo "[" . date('Y-m-d H:i:s') . "] Getting current $label address...\n";
+    $ip = getCurrentIP($recordType);
+    if (!$ip) {
+        echo "[" . date('Y-m-d H:i:s') . "] ERROR: Could not determine current $label address\n";
+        exit(1);
+    }
+    echo "[" . date('Y-m-d H:i:s') . "] Current $label: $ip\n";
+    $currentIPs[$recordType] = $ip;
+    $typeChanges[$recordType] = hasIPChanged($recordType, $ip);
+    if ($typeChanges[$recordType]) {
+        echo "[" . date('Y-m-d H:i:s') . "] INFO: $label changed since last update\n";
+    } else {
+        echo "[" . date('Y-m-d H:i:s') . "] INFO: $label unchanged since last update\n";
+    }
+}
+
+if (!in_array(true, $typeChanges, true)) {
+    echo "[" . date('Y-m-d H:i:s') . "] INFO: IP addresses unchanged, skipping update\n";
+    exit(0);
+}
+
+echo "[" . date('Y-m-d H:i:s') . "] IP change detected, updating DNS records...\n";
+
+// Process each domain
+foreach ($domainsToProcess as $domain) {
+    $recordType = $domain['type'];
+    if (empty($typeChanges[$recordType])) {
+        echo "[" . date('Y-m-d H:i:s') . "] INFO: Skipping {$domain['name']} (no $recordType change)\n";
+        $skippedCount++;
+        continue;
+    }
     
-    // Perform DNS update
+    echo "[" . date('Y-m-d H:i:s') . "] Updating {$domain['name']} ($recordType)...\n";
+    
     $response = updateDNSRecord(
         $config['api_token'],
         $domain['zone_id'],
         $domain['record_id'],
         $domain['name'],
-        $currentIP,
+        $currentIPs[$recordType],
+        $recordType,
         $domain['proxied'] ?? false
     );
     
@@ -265,7 +321,7 @@ foreach ($config['domains'] as $domain) {
     $error = '';
     
     if ($success) {
-        echo "[" . date('Y-m-d H:i:s') . "] SUCCESS: {$domain['name']} updated to $currentIP\n";
+        echo "[" . date('Y-m-d H:i:s') . "] SUCCESS: {$domain['name']} updated to {$currentIPs[$recordType]}\n";
         $updateCount++;
     } else {
         if (isset($response['errors']) && is_array($response['errors'])) {
@@ -277,12 +333,10 @@ foreach ($config['domains'] as $domain) {
         $errorCount++;
     }
     
-    // Log the update attempt
-    logUpdate($domain['name'], $currentIP, $success, $error, true);
+    logUpdate($domain['name'], $currentIPs[$recordType], $recordType, $success, $error, true);
     
-    // Small delay between updates to be nice to the API
-    if (count($config['domains']) > 1) {
-        usleep(500000); // 0.5 seconds
+    if (count($domainsToProcess) > 1) {
+        usleep(500000);
     }
 }
 

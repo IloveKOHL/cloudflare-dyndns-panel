@@ -117,6 +117,7 @@ echo "\n";
 echo "5. Internet Connectivity Check:\n";
 $test_urls = [
     'https://api.ipify.org' => 'IP detection service',
+    'https://api6.ipify.org' => 'IPv6 detection service',
     'https://api.cloudflare.com/client/v4/zones' => 'Cloudflare API'
 ];
 
@@ -137,32 +138,46 @@ foreach ($test_urls as $url => $description) {
 }
 echo "\n";
 
-// Test 6: Test IP detection
+// Test 6: IP Detection
 echo "6. IP Detection Test:\n";
-$ip_services = [
-    'https://api.ipify.org',
-    'https://ipv4.icanhazip.com',
-    'https://checkip.amazonaws.com'
+$ipTests = [
+    'A' => [
+        'https://api.ipify.org',
+        'https://ipv4.icanhazip.com',
+        'https://checkip.amazonaws.com'
+    ],
+    'AAAA' => [
+        'https://api6.ipify.org',
+        'https://ipv6.icanhazip.com',
+        'https://v6.ident.me'
+    ]
 ];
 
-$detected_ips = [];
-foreach ($ip_services as $service) {
-    $ip = @file_get_contents($service);
-    if ($ip && filter_var(trim($ip), FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-        $ip = trim($ip);
-        $detected_ips[] = $ip;
-        echo "   ✅ $service: $ip\n";
-    } else {
-        echo "   ❌ $service: Failed\n";
+foreach ($ipTests as $type => $services) {
+    $label = $type === 'AAAA' ? 'IPv6' : 'IPv4';
+    echo "   🔎 $label services:\n";
+    $detected = [];
+    $flag = $type === 'AAAA' ? FILTER_FLAG_IPV6 : FILTER_FLAG_IPV4;
+    foreach ($services as $service) {
+        $ip = @file_get_contents($service);
+        if ($ip && filter_var(trim($ip), FILTER_VALIDATE_IP, $flag)) {
+            $ip = trim($ip);
+            $detected[] = $ip;
+            echo "      ✅ $service: $ip\n";
+        } else {
+            echo "      ❌ $service: Failed\n";
+        }
     }
-}
-
-if (!empty($detected_ips)) {
-    $unique_ips = array_unique($detected_ips);
-    if (count($unique_ips) === 1) {
-        echo "   ✅ All services report same IP: {$unique_ips[0]}\n";
+    
+    if (!empty($detected)) {
+        $unique = array_unique($detected);
+        if (count($unique) === 1) {
+            echo "      ✅ Consistent $label address: {$unique[0]}\n";
+        } else {
+            echo "      ⚠️  Services report different $label addresses: " . implode(', ', $unique) . "\n";
+        }
     } else {
-        echo "   ⚠️  Services report different IPs: " . implode(', ', $unique_ips) . "\n";
+        echo "      ⚠️  $label detection unavailable on this host\n";
     }
 }
 echo "\n";

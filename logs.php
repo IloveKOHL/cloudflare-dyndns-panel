@@ -272,9 +272,10 @@ $pagedLogs = array_slice($logs, $offset, $perPage);
                     <tr>
                         <th>Timestamp</th>
                         <th>Domain</th>
+                        <th>Record Type</th>
                         <th>IP Address</th>
                         <th>Status</th>
-                        <th>Type</th>
+                        <th>Mode</th>
                         <th>Error</th>
                     </tr>
                 </thead>
@@ -283,6 +284,7 @@ $pagedLogs = array_slice($logs, $offset, $perPage);
                         <tr>
                             <td><?= htmlspecialchars($log['timestamp']) ?></td>
                             <td><?= htmlspecialchars($log['domain']) ?></td>
+                            <td><?= htmlspecialchars($log['record_type'] ?? 'A') ?></td>
                             <td><?= htmlspecialchars($log['ip']) ?></td>
                             <td>
                                 <span class="<?= $log['success'] ? 'status-success' : 'status-error' ?>">

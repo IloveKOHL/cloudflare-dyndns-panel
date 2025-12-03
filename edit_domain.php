@@ -9,7 +9,21 @@ function loadConfig() {
     if (!file_exists('config.json')) {
         return ['api_token' => '', 'domains' => []];
     }
-    return json_decode(file_get_contents('config.json'), true);
+    $config = json_decode(file_get_contents('config.json'), true);
+    if (!$config || !isset($config['domains']) || !is_array($config['domains'])) {
+        $config['domains'] = [];
+    }
+    if (!empty($config['domains'])) {
+        foreach ($config['domains'] as &$domain) {
+            if (!isset($domain['type'])) {
+                $domain['type'] = 'A';
+            } else {
+                $domain['type'] = strtoupper($domain['type']) === 'AAAA' ? 'AAAA' : 'A';
+            }
+        }
+        unset($domain);
+    }
+    return $config;
 }
 
 // Save configuration
@@ -55,6 +69,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_domain'])) {
         $config['domains'][$domainIndex]['zone_id'] = trim($_POST['zone_id']);
         $config['domains'][$domainIndex]['record_id'] = trim($_POST['record_id']);
         $config['domains'][$domainIndex]['name'] = trim($_POST['domain_name']);
+        $recordType = strtoupper($_POST['record_type'] ?? 'A');
+        $config['domains'][$domainIndex]['type'] = $recordType === 'AAAA' ? 'AAAA' : 'A';
         $config['domains'][$domainIndex]['proxied'] = isset($_POST['proxied']);
         
         if (saveConfig($config)) {
@@ -132,19 +148,21 @@ if (!isset($_SESSION['csrf_token'])) {
             font-weight: 500;
         }
 
-        .form-group input {
-            width: 100%;
-            padding: 12px 16px;
-            border: 2px solid #e1e5e9;
-            border-radius: 8px;
-            font-size: 16px;
-            transition: border-color 0.3s ease;
-        }
+        .form-group input,
+                .form-group select {
+                    width: 100%;
+                    padding: 12px 16px;
+                    border: 2px solid #e1e5e9;
+                    border-radius: 8px;
+                    font-size: 16px;
+                    transition: border-color 0.3s ease;
+                }
 
-        .form-group input:focus {
-            outline: none;
-            border-color: #667eea;
-        }
+                .form-group input:focus,
+                .form-group select:focus {
+                    outline: none;
+                    border-color: #667eea;
+                }
 
         .checkbox-group {
             display: flex;
@@ -276,6 +294,7 @@ if (!isset($_SESSION['csrf_token'])) {
         <div class="domain-info">
             <h3><?= htmlspecialchars($domain['name']) ?></h3>
             <p><strong>Status:</strong> <?= $domain['enabled'] ? 'Active' : 'Disabled' ?></p>
+            <p><strong>Record Type:</strong> <?= htmlspecialchars($domain['type'] ?? 'A') ?></p>
             <p><strong>Proxied:</strong> <?= $domain['proxied'] ? 'Yes' : 'No' ?></p>
         </div>
 
@@ -298,6 +317,14 @@ if (!isset($_SESSION['csrf_token'])) {
                 <label for="domain_name">Domain Name</label>
                 <input type="text" id="domain_name" name="domain_name" 
                        value="<?= htmlspecialchars($domain['name']) ?>" required>
+            </div>
+
+            <div class="form-group">
+                <label for="record_type">Record Type</label>
+                <select id="record_type" name="record_type">
+                    <option value="A" <?= ($domain['type'] ?? 'A') === 'A' ? 'selected' : '' ?>>A (IPv4)</option>
+                    <option value="AAAA" <?= ($domain['type'] ?? 'A') === 'AAAA' ? 'selected' : '' ?>>AAAA (IPv6)</option>
+                </select>
             </div>
 
             <div class="form-group">

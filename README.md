@@ -21,18 +21,23 @@ A modern, secure, and feature-rich Dynamic DNS management panel for Cloudflare. 
 - **Enable/disable domains** without deletion
 - **Bulk operations** for all domains
 
+### 🌍 **Dual-Stack Ready**
+- **A + AAAA record management** from the same dashboard
+- **Automatic IPv4/IPv6 detection** with per-stack change tracking
+- **Skip unnecessary updates** when only one IP family changes
+
 ### 🔍 **Smart Domain Discovery**
 - **Automatic domain browser** - no manual ID lookup needed
 - **One-click domain addition** from Cloudflare API
-- **Real-time A-record display**
+- **Real-time A/AAAA record display**
 - **Proxy status detection**
 
 ### ⏰ **Flexible Automation**
 - **Configurable update intervals**:
-  - Manual only
-  - Every 5, 15, 30 minutes
-  - Every 1, 6, 12 hours
-  - Daily updates
+   - Manual only (no automatic updates)
+   - Every 5, 15, 30 minutes
+   - Every 1, 6, 12 hours
+   - Daily updates
 - **Automatic cron job generation**
 - **IP change detection** (only updates when needed)
 - **Comprehensive logging**
@@ -146,7 +151,7 @@ Client IP Address Filtering:
 
 ### Why These Permissions?
 - **Zone:Read** - List your domains and find Zone IDs
-- **DNS:Edit** - Update A records with new IP addresses
+- **DNS:Edit** - Update A/AAAA records with new IP addresses
 - **No other permissions needed** - Maximum security!
 
 ## 📖 Usage Guide
@@ -163,7 +168,7 @@ Client IP Address Filtering:
 #### Method 1: Domain Browser (Recommended)
 1. Click **"Load My Domains"**
 2. Select your domain
-3. Click **"Show A Records"**
+3. Click **"Show DNS Records"**
 4. Click **"Add"** next to the record you want to manage
 
 #### Method 2: Manual Entry
@@ -198,7 +203,7 @@ cloudflare-dyndns-panel/
 ├── api_helper.php         # API communication helper
 ├── config.json            # Configuration file (auto-created)
 ├── update_log.json        # Update logs (auto-created)
-├── last_ip.txt           # Last known IP (auto-created)
+├── last_ip.json          # Last known IPv4/IPv6 (auto-created)
 └── README.md              # This file
 ```
 
@@ -239,7 +244,7 @@ If PHP is not in `/usr/bin/php`, edit the cron command:
 
 ### IP Change Detection
 The system only updates DNS when your IP actually changes:
-- Current IP stored in `last_ip.txt`
+- Current IPs stored in `last_ip.json` (tracked separately for A and AAAA)
 - Saves API calls and reduces logs
 - Can be disabled by deleting the file
 

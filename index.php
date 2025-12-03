@@ -43,8 +43,18 @@ function loadConfig() {
     if (!isset($config['api_token'])) {
         $config['api_token'] = '';
     }
-    if (!isset($config['domains'])) {
+    if (!isset($config['domains']) || !is_array($config['domains'])) {
         $config['domains'] = [];
+    }
+    if (!empty($config['domains'])) {
+        foreach ($config['domains'] as &$domain) {
+            if (!isset($domain['type'])) {
+                $domain['type'] = 'A';
+            } else {
+                $domain['type'] = strtoupper($domain['type']) === 'AAAA' ? 'AAAA' : 'A';
+            }
+        }
+        unset($domain);
     }
     if (!isset($config['update_interval'])) {
         $config['update_interval'] = 'manual';
@@ -58,10 +68,22 @@ function saveConfig($config) {
     return file_put_contents('config.json', json_encode($config, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
 }
 
-// Get current IP
-function getCurrentIP() {
-    $ip = @file_get_contents("https://api.ipify.org");
-    return $ip ?: 'Unknown';
+// Get current IP for given record type
+function getCurrentIP($type = 'A') {
+    $type = strtoupper($type) === 'AAAA' ? 'AAAA' : 'A';
+    $services = $type === 'AAAA'
+        ? ['https://api6.ipify.org', 'https://ipv6.icanhazip.com', 'https://v6.ident.me']
+        : ['https://api.ipify.org', 'https://ipv4.icanhazip.com', 'https://checkip.amazonaws.com'];
+    $flag = $type === 'AAAA' ? FILTER_FLAG_IPV6 : FILTER_FLAG_IPV4;
+    
+    foreach ($services as $service) {
+        $ip = @file_get_contents($service);
+        if ($ip && filter_var(trim($ip), FILTER_VALIDATE_IP, $flag)) {
+            return trim($ip);
+        }
+    }
+    
+    return false;
 }
 
 // Generate cron command based on interval
@@ -127,24 +149,41 @@ function getCloudflareZones($apiToken) {
 
 // Get DNS records for a zone
 function getDNSRecords($apiToken, $zoneId) {
-    $url = "https://api.cloudflare.com/client/v4/zones/$zoneId/dns_records?type=A";
-    $options = [
-        "http" => [
-            "header" => [
-                "Authorization: Bearer $apiToken",
-                "Content-Type: application/json"
-            ],
-            "method" => "GET"
-        ]
-    ];
-    $context = stream_context_create($options);
-    $result = @file_get_contents($url, false, $context);
+    $records = [];
+    $types = ['A', 'AAAA'];
     
-    if ($result) {
-        $response = json_decode($result, true);
-        return $response['success'] ? $response['result'] : [];
+    foreach ($types as $type) {
+        $url = "https://api.cloudflare.com/client/v4/zones/$zoneId/dns_records?type=$type";
+        $options = [
+            "http" => [
+                "header" => [
+                    "Authorization: Bearer $apiToken",
+                    "Content-Type: application/json"
+                ],
+                "method" => "GET"
+            ]
+        ];
+        $context = stream_context_create($options);
+        $result = @file_get_contents($url, false, $context);
+        
+        if ($result) {
+            $response = json_decode($result, true);
+            if ($response['success']) {
+                $records = array_merge($records, $response['result']);
+            }
+        }
     }
-    return [];
+    
+    if (!empty($records)) {
+        usort($records, function($a, $b) {
+            if ($a['name'] === $b['name']) {
+                return strcmp($a['type'], $b['type']);
+            }
+            return strcmp($a['name'], $b['name']);
+        });
+    }
+    
+    return $records;
 }
 
 $config = loadConfig();
@@ -203,11 +242,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_domain']) && isse
     if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
         $error = "Invalid request";
     } else {
+        $recordType = strtoupper($_POST['record_type'] ?? 'A');
+        $recordType = $recordType === 'AAAA' ? 'AAAA' : 'A';
         $domain = [
             'id' => uniqid(),
             'zone_id' => trim($_POST['zone_id']),
             'record_id' => trim($_POST['record_id']),
             'name' => trim($_POST['domain_name']),
+            'type' => $recordType,
             'proxied' => isset($_POST['proxied']),
             'enabled' => true
         ];
@@ -267,11 +309,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['quick_add_domain']) &
     if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
         $error = "Invalid request";
     } else {
+        $recordType = strtoupper($_POST['record_type'] ?? 'A');
+        $recordType = $recordType === 'AAAA' ? 'AAAA' : 'A';
         $domain = [
             'id' => uniqid(),
             'zone_id' => trim($_POST['zone_id']),
             'record_id' => trim($_POST['record_id']),
             'name' => trim($_POST['name']),
+            'type' => $recordType,
             'proxied' => isset($_POST['proxied']) && $_POST['proxied'] === '1',
             'enabled' => true
         ];
@@ -295,7 +340,10 @@ if (isset($_SESSION['logged_in']) && !isset($_SESSION['csrf_token'])) {
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 }
 
-$currentIP = getCurrentIP();
+$currentIPs = [
+    'A' => getCurrentIP('A'),
+    'AAAA' => getCurrentIP('AAAA')
+];
 $intervalOptions = getIntervalOptions();
 ?>
 
@@ -701,9 +749,18 @@ $intervalOptions = getIntervalOptions();
 
             <!-- Current IP Info -->
             <div class="info-box">
-                <h3>📍 Current IP Address</h3>
-                <p><strong><?= htmlspecialchars($currentIP) ?></strong></p>
-                <p>This IP will be used for DNS updates</p>
+                <h3>📍 Current IP Addresses</h3>
+                <?php foreach ($currentIPs as $type => $ipValue): ?>
+                    <p>
+                        <strong><?= $type === 'AAAA' ? 'IPv6' : 'IPv4' ?>:</strong>
+                        <?php if ($ipValue): ?>
+                            <?= htmlspecialchars($ipValue) ?>
+                        <?php else: ?>
+                            <span style="color:#dc3545;">Unavailable</span>
+                        <?php endif; ?>
+                    </p>
+                <?php endforeach; ?>
+                <p>Only available addresses are used for DNS updates</p>
             </div>
 
             <!-- API Token Configuration -->
@@ -762,6 +819,7 @@ $intervalOptions = getIntervalOptions();
                                 <h4><?= htmlspecialchars($domain['name']) ?></h4>
                                 <p>Zone ID: <?= htmlspecialchars($domain['zone_id']) ?></p>
                                 <p>Record ID: <?= htmlspecialchars($domain['record_id']) ?></p>
+                                <p>Record Type: <?= htmlspecialchars($domain['type'] ?? 'A') ?></p>
                                 <div style="margin-top: 8px;">
                                     <span class="status-badge <?= $domain['enabled'] ? 'status-enabled' : 'status-disabled' ?>">
                                         <?= $domain['enabled'] ? 'Active' : 'Disabled' ?>
@@ -830,6 +888,14 @@ $intervalOptions = getIntervalOptions();
                             <label for="domain_name">Domain Name</label>
                             <input type="text" id="domain_name" name="domain_name" 
                                    placeholder="e.g. dyn.example.com" required>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="record_type">Record Type</label>
+                            <select id="record_type" name="record_type">
+                                <option value="A">A (IPv4)</option>
+                                <option value="AAAA">AAAA (IPv6)</option>
+                            </select>
                         </div>
                         
                         <div class="form-group">
@@ -902,7 +968,7 @@ function displayZones(zones) {
                 <p><small>Zone ID: ${zone.id}</small></p>
                 <button type="button" onclick="loadRecords('${zone.id}', '${zone.name}')" 
                         class="btn btn-small btn-secondary">
-                    📋 Show A Records
+                    📋 Show DNS Records
                 </button>
                 <div id="records-${zone.id}" class="records-container"></div>
             </div>
@@ -935,7 +1001,7 @@ function displayRecords(records, zoneId, zoneName) {
     const container = document.getElementById(`records-${zoneId}`);
     
     if (records.length === 0) {
-        container.innerHTML = '<p><small>No A records found.</small></p>';
+        container.innerHTML = '<p><small>No A or AAAA records found.</small></p>';
         return;
     }
     
@@ -946,13 +1012,14 @@ function displayRecords(records, zoneId, zoneName) {
             <div class="record-item">
                 <div class="record-info">
                     <strong>${record.name}</strong><br>
-                    <small>IP: ${record.content} | Proxied: ${record.proxied ? 'Yes' : 'No'}</small>
+                    <small>Type: ${record.type} | Content: ${record.content} | Proxied: ${record.proxied ? 'Yes' : 'No'}</small>
                 </div>
                 <form method="POST" style="display: inline;">
                     <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
                     <input type="hidden" name="zone_id" value="${zoneId}">
                     <input type="hidden" name="record_id" value="${record.id}">
                     <input type="hidden" name="name" value="${record.name}">
+                    <input type="hidden" name="record_type" value="${record.type}">
                     <input type="hidden" name="proxied" value="${record.proxied ? '1' : '0'}">
                     <button type="submit" name="quick_add_domain" class="btn btn-small btn-success">
                         ➕ Add
