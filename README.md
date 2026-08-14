@@ -53,12 +53,12 @@ A modern, secure, and feature-rich Dynamic DNS management panel for Cloudflare. 
 
 ### 🐳 Docker Guide
 
-You can run the Cloudflare DynDNS Panel easily using Docker. This is the recommended way for most users.
+You can run the Cloudflare DynDNS Panel directly from the published GitHub Container Registry image. No local build is required.
 
-#### 1. Build the Docker image
+#### 1. Pull the image
 
 ```bash
-docker build -t cloudflare-dyndns-panel .
+docker pull ghcr.io/ilovekohl/cloudflare-dyndns-panel:latest
 ```
 
 #### 2. Run the container
@@ -67,12 +67,12 @@ docker build -t cloudflare-dyndns-panel .
 docker run -d \
   --name cloudflare-dyndns-panel \
   -p 8080:80 \
-  cloudflare-dyndns-panel
+   ghcr.io/ilovekohl/cloudflare-dyndns-panel:latest
 ```
 
 - The panel will be available at [http://localhost:8080](http://localhost:8080)
-- The `-v` options ensure your configuration and logs persist outside the container.
 - Adjust the port (`8080:80`) as needed.
+- If you want persistent data, mount volumes for the configuration and log files.
 
 #### 3. (Optional) Set up a cron job for automatic updates
 
@@ -90,8 +90,8 @@ crontab -e
 
 #### 4. Update and logs
 
-- All configuration and logs are stored in the mounted volumes.
-- To update the panel, pull the latest code and rebuild the image.
+- All configuration and logs are stored in the container or in mounted volumes if you add them.
+- To update the panel, pull the latest image tag again and restart the container.
 
 ---
 
