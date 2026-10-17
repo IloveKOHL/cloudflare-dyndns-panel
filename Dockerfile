@@ -1,34 +1,24 @@
 FROM php:8.2-apache
 
-# Install required PHP extensions and utilities
-RUN apt-get update && \
-    apt-get install -y \
-        libzip-dev \
-        libpng-dev \
-        libonig-dev \
-        zip \
-        unzip \
-        git \
-        curl \
-        cron \
-        nano \
-    && docker-php-ext-install pdo pdo_mysql mysqli
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cron \
+    && rm -rf /var/lib/apt/lists/* \
+    && printf '%s\n' 'expose_php=Off' 'display_errors=Off' 'log_errors=On' > /usr/local/etc/php/conf.d/security.ini
 
-# Enable Apache mod_rewrite
-RUN a2enmod rewrite
+# Copy only runtime files to Apache web root
+COPY --chown=root:root *.php .htaccess /var/www/html/
+COPY --chown=root:root img /var/www/html/img
+COPY --chown=root:root docker-entrypoint.sh /docker-entrypoint.sh
+COPY docker/apache-security.conf /etc/apache2/conf-available/dyndns-security.conf
+RUN a2enconf dyndns-security \
+    && install -d -o www-data -g www-data -m 0700 /var/lib/cloudflare-dyndns-panel \
+    && chmod 0755 /docker-entrypoint.sh
 
-# Copy project files to Apache web root
-COPY . /var/www/html/
-
-# Set permissions (optional, adjust as needed)
-RUN chown -R www-data:www-data /var/www/html
+ENV DYNDNS_DATA_DIR=/var/lib/cloudflare-dyndns-panel
+VOLUME ["/var/lib/cloudflare-dyndns-panel"]
 
 # Expose port 80
 EXPOSE 80
-
-# Add entrypoint script to start both Apache and cron
-COPY docker-entrypoint.sh /docker-entrypoint.sh
-RUN chmod +x /docker-entrypoint.sh
 
 # Use the custom entrypoint script
 CMD ["/docker-entrypoint.sh"]

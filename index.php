@@ -1,89 +1,48 @@
 <?php
-session_start();
+declare(strict_types=1);
 
-// Load configuration
-function loadConfig() {
-    if (!file_exists('config.json')) {
-        // Create new config with default password
-        $defaultConfig = [
-            'password' => password_hash('changeme', PASSWORD_DEFAULT),
-            'api_token' => '',
-            'domains' => [],
-            'update_interval' => 'manual'
-        ];
-        
-        // Save the default config
-        file_put_contents('config.json', json_encode($defaultConfig, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-        
-        return $defaultConfig;
-    }
-    
-    $config = json_decode(file_get_contents('config.json'), true);
-    
-    // Check if config is empty or corrupted
-    if (!$config || !is_array($config)) {
-        // Create new config with default password
-        $defaultConfig = [
-            'password' => password_hash('changeme', PASSWORD_DEFAULT),
-            'api_token' => '',
-            'domains' => [],
-            'update_interval' => 'manual'
-        ];
-        
-        // Save the default config
-        file_put_contents('config.json', json_encode($defaultConfig, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-        
-        return $defaultConfig;
-    }
-    
-    // Ensure all required keys exist
-    if (!isset($config['password'])) {
-        $config['password'] = password_hash('changeme', PASSWORD_DEFAULT);
-    }
-    if (!isset($config['api_token'])) {
-        $config['api_token'] = '';
-    }
-    if (!isset($config['domains'])) {
-        $config['domains'] = [];
-    }
-    if (!isset($config['update_interval'])) {
-        $config['update_interval'] = 'manual';
-    }
-    
-    return $config;
-}
+require_once __DIR__ . '/bootstrap.php';
+require_once __DIR__ . '/cloudflare_api.php';
 
-// Save configuration
-function saveConfig($config) {
-    return file_put_contents('config.json', json_encode($config, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-}
+startSecureSession();
+$cspNonce = cspNonce();
 
 // Get current IP
 function getCurrentIP() {
-    $ip = @file_get_contents("https://api.ipify.org");
-    return $ip ?: 'Unknown';
+    $context = stream_context_create(['http' => ['timeout' => 10, 'max_redirects' => 0]]);
+    $ip = @file_get_contents('https://api.ipify.org', false, $context, 0, 64);
+    $ip = $ip === false ? '' : trim($ip);
+    return filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false ? $ip : 'Unknown';
 }
 
 // Generate cron command based on interval
 function generateCronCommand($interval, $scriptPath) {
     $phpPath = '/usr/bin/php'; // Adjust if needed
     $fullPath = realpath($scriptPath);
+    if ($fullPath === false) {
+        return null;
+    }
+    $quotedPath = escapeshellarg($fullPath);
+    $dataDirectory = getenv('DYNDNS_DATA_DIR');
+    $environment = $dataDirectory !== false && trim($dataDirectory) !== ''
+        ? 'DYNDNS_DATA_DIR=' . escapeshellarg(trim($dataDirectory)) . ' '
+        : '';
     
     switch ($interval) {
         case '5min':
-            return "*/5 * * * * $phpPath $fullPath";
+            return "*/5 * * * * {$environment}$phpPath $quotedPath";
         case '15min':
-            return "*/15 * * * * $phpPath $fullPath";
+            return "*/15 * * * * {$environment}$phpPath $quotedPath";
         case '30min':
-            return "*/30 * * * * $phpPath $fullPath";
+            return "*/30 * * * * {$environment}$phpPath $quotedPath";
         case '1hour':
-            return "0 * * * * $phpPath $fullPath";
+            return "0 * * * * {$environment}$phpPath $quotedPath";
         case '6hours':
-            return "0 */6 * * * $phpPath $fullPath";
+            return "0 */6 * * * {$environment}$phpPath $quotedPath";
         case '12hours':
-            return "0 */12 * * * $phpPath $fullPath";
+            return "0 */12 * * * {$environment}$phpPath $quotedPath";
         case 'daily':
-            return "0 0 * * * $phpPath $fullPath";
+            return "0 0 * * * {$environment}$phpPath $quotedPath";
         default:
             return null;
     }
@@ -103,200 +62,190 @@ function getIntervalOptions() {
     ];
 }
 
-// Get Cloudflare zones
-function getCloudflareZones($apiToken) {
-    $url = "https://api.cloudflare.com/client/v4/zones";
-    $options = [
-        "http" => [
-            "header" => [
-                "Authorization: Bearer $apiToken",
-                "Content-Type: application/json"
-            ],
-            "method" => "GET"
-        ]
-    ];
-    $context = stream_context_create($options);
-    $result = @file_get_contents($url, false, $context);
-    
-    if ($result) {
-        $response = json_decode($result, true);
-        return $response['success'] ? $response['result'] : [];
-    }
-    return [];
-}
-
-// Get DNS records for a zone
-function getDNSRecords($apiToken, $zoneId) {
-    $url = "https://api.cloudflare.com/client/v4/zones/$zoneId/dns_records?type=A";
-    $options = [
-        "http" => [
-            "header" => [
-                "Authorization: Bearer $apiToken",
-                "Content-Type: application/json"
-            ],
-            "method" => "GET"
-        ]
-    ];
-    $context = stream_context_create($options);
-    $result = @file_get_contents($url, false, $context);
-    
-    if ($result) {
-        $response = json_decode($result, true);
-        return $response['success'] ? $response['result'] : [];
-    }
-    return [];
-}
-
 $config = loadConfig();
 $error = '';
 $success = '';
 
 // Handle login
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login'])) {
-    if (password_verify($_POST['password'], $config['password'])) {
+    $retryAfter = loginRetryAfter();
+    if (!verifyCsrfToken($_POST['csrf_token'] ?? null)) {
+        $error = "Invalid request";
+    } elseif ($retryAfter > 0) {
+        http_response_code(429);
+        header('Retry-After: ' . $retryAfter);
+        $error = "Too many failed attempts. Try again later.";
+    } elseif (isset($_POST['password']) && is_string($_POST['password']) && password_verify($_POST['password'], $config['password'])) {
+        clearLoginFailures();
+        session_regenerate_id(true);
         $_SESSION['logged_in'] = true;
         $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
         header("Location: index.php");
         exit;
     } else {
+        recordLoginFailure();
         $error = "Invalid password";
     }
 }
 
 // Handle logout
-if (isset($_GET['logout'])) {
-    session_destroy();
-    header("Location: index.php");
-    exit;
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['logout']) && isLoggedIn()) {
+    if (!verifyCsrfToken($_POST['csrf_token'] ?? null)) {
+        http_response_code(400);
+        $error = "Invalid request";
+    } else {
+        logoutSession();
+        header("Location: index.php");
+        exit;
+    }
+}
+
+if (isLoggedIn()) {
+    requirePasswordChangeComplete($config);
 }
 
 // Handle API token save
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_token']) && isset($_SESSION['logged_in'])) {
-    if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_token']) && isLoggedIn()) {
+    if (!verifyCsrfToken($_POST['csrf_token'] ?? null)) {
         $error = "Invalid request";
+    } elseif (($environmentToken = getenv('CLOUDFLARE_API_TOKEN')) !== false && trim($environmentToken) !== '') {
+        $error = "The API token is managed by the CLOUDFLARE_API_TOKEN environment variable.";
     } else {
-        $config['api_token'] = trim($_POST['api_token']);
-        if (saveConfig($config)) {
-            $success = "API Token saved successfully!";
+        $token = isset($_POST['api_token']) && is_string($_POST['api_token']) ? trim($_POST['api_token']) : '';
+        if ($token === '') {
+            $error = "Enter a new API token; the existing token was left unchanged.";
+        } elseif (strlen($token) > 512 || preg_match('/[\r\n]/', $token)) {
+            $error = "Invalid API token format.";
         } else {
-            $error = "Error saving API Token";
+            $verification = cloudflareRequest('GET', '/user/tokens/verify', $token);
+            $active = !empty($verification['success'])
+                && isset($verification['result']['status'])
+                && $verification['result']['status'] === 'active';
+            if (!$active) {
+                $error = "Cloudflare rejected the API token.";
+            } else {
+                $config['api_token'] = $token;
+                if (saveConfig($config)) {
+                    $success = "API Token verified and saved successfully!";
+                } else {
+                    $error = "Error saving API Token";
+                }
+            }
         }
     }
 }
 
 // Handle update interval save
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_interval']) && isset($_SESSION['logged_in'])) {
-    if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_interval']) && isLoggedIn()) {
+    if (!verifyCsrfToken($_POST['csrf_token'] ?? null)) {
         $error = "Invalid request";
     } else {
-        $config['update_interval'] = $_POST['update_interval'];
-        if (saveConfig($config)) {
-            $success = "Update interval saved successfully!";
+        $interval = isset($_POST['update_interval']) ? (string) $_POST['update_interval'] : '';
+        if (!in_array($interval, allowedUpdateIntervals(), true)) {
+            $error = "Invalid update interval";
         } else {
-            $error = "Error saving update interval";
+            $config['update_interval'] = $interval;
+            if (saveConfig($config)) {
+                $success = "Update interval saved successfully!";
+            } else {
+                $error = "Error saving update interval";
+            }
         }
     }
 }
 
 // Handle domain addition
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_domain']) && isset($_SESSION['logged_in'])) {
-    if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_domain']) && isLoggedIn()) {
+    if (!verifyCsrfToken($_POST['csrf_token'] ?? null)) {
         $error = "Invalid request";
     } else {
-        $domain = [
-            'id' => uniqid(),
-            'zone_id' => trim($_POST['zone_id']),
-            'record_id' => trim($_POST['record_id']),
-            'name' => trim($_POST['domain_name']),
-            'proxied' => isset($_POST['proxied']),
-            'enabled' => true
-        ];
-        
-        if (!isset($config['domains'])) {
-            $config['domains'] = [];
-        }
-        
-        $config['domains'][] = $domain;
-        
-        if (saveConfig($config)) {
-            $success = "Domain added successfully!";
-        } else {
-            $error = "Error adding domain";
-        }
-    }
-}
-
-// Handle domain deletion
-if (isset($_GET['delete_domain']) && isset($_SESSION['logged_in'])) {
-    $domainId = $_GET['delete_domain'];
-    if (isset($config['domains'])) {
-        $config['domains'] = array_filter($config['domains'], function($domain) use ($domainId) {
-            return $domain['id'] !== $domainId;
-        });
-        $config['domains'] = array_values($config['domains']);
-        
-        if (saveConfig($config)) {
-            $success = "Domain deleted successfully!";
-        } else {
-            $error = "Error deleting domain";
-        }
-    }
-}
-
-// Handle domain toggle
-if (isset($_GET['toggle_domain']) && isset($_SESSION['logged_in'])) {
-    $domainId = $_GET['toggle_domain'];
-    if (isset($config['domains'])) {
-        foreach ($config['domains'] as &$domain) {
-            if ($domain['id'] === $domainId) {
-                $domain['enabled'] = !$domain['enabled'];
-                break;
+        try {
+            $domain = validatedDomainInput($_POST);
+            $domain['id'] = bin2hex(random_bytes(16));
+            $domain['enabled'] = true;
+            $config['domains'][] = $domain;
+            if (saveConfig($config)) {
+                $success = "Domain added successfully!";
+            } else {
+                array_pop($config['domains']);
+                $error = "Error adding domain";
             }
+        } catch (InvalidArgumentException $exception) {
+            $error = $exception->getMessage();
         }
-        
-        if (saveConfig($config)) {
-            $success = "Domain status changed successfully!";
+    }
+}
+
+// Handle domain deletion and toggle via CSRF-protected POST requests.
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['domain_action']) && isLoggedIn()) {
+    if (!verifyCsrfToken($_POST['csrf_token'] ?? null)) {
+        $error = "Invalid request";
+    } else {
+        $domainId = isset($_POST['domain_id']) ? (string) $_POST['domain_id'] : '';
+        $action = (string) $_POST['domain_action'];
+        if (!preg_match('/^[a-f0-9]{13,32}$/i', $domainId) || !in_array($action, ['delete', 'toggle'], true)) {
+            $error = "Invalid domain action";
+        } elseif ($action === 'delete') {
+            $originalCount = count($config['domains']);
+            $config['domains'] = array_values(array_filter($config['domains'], static function ($domain) use ($domainId) {
+                return !isset($domain['id']) || !hash_equals((string) $domain['id'], $domainId);
+            }));
+            if (count($config['domains']) === $originalCount) {
+                $error = "Domain not found";
+            } elseif (saveConfig($config)) {
+                $success = "Domain deleted successfully!";
+            } else {
+                $error = "Error deleting domain";
+            }
         } else {
-            $error = "Error changing domain status";
+            $found = false;
+            foreach ($config['domains'] as &$domain) {
+                if (isset($domain['id']) && hash_equals((string) $domain['id'], $domainId)) {
+                    $domain['enabled'] = empty($domain['enabled']);
+                    $found = true;
+                    break;
+                }
+            }
+            unset($domain);
+            if (!$found) {
+                $error = "Domain not found";
+            } elseif (saveConfig($config)) {
+                $success = "Domain status changed successfully!";
+            } else {
+                $error = "Error changing domain status";
+            }
         }
     }
 }
 
 // Handle quick add domain from browser
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['quick_add_domain']) && isset($_SESSION['logged_in'])) {
-    if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['quick_add_domain']) && isLoggedIn()) {
+    if (!verifyCsrfToken($_POST['csrf_token'] ?? null)) {
         $error = "Invalid request";
     } else {
-        $domain = [
-            'id' => uniqid(),
-            'zone_id' => trim($_POST['zone_id']),
-            'record_id' => trim($_POST['record_id']),
-            'name' => trim($_POST['name']),
-            'proxied' => isset($_POST['proxied']) && $_POST['proxied'] === '1',
-            'enabled' => true
-        ];
-        
-        if (!isset($config['domains'])) {
-            $config['domains'] = [];
-        }
-        
-        $config['domains'][] = $domain;
-        
-        if (saveConfig($config)) {
-            $success = "Domain '" . htmlspecialchars($domain['name']) . "' added successfully!";
-        } else {
-            $error = "Error adding domain";
+        try {
+            $domain = validatedDomainInput($_POST);
+            $domain['id'] = bin2hex(random_bytes(16));
+            $domain['enabled'] = true;
+            $config['domains'][] = $domain;
+            if (saveConfig($config)) {
+                $success = "Domain '" . $domain['name'] . "' added successfully!";
+            } else {
+                array_pop($config['domains']);
+                $error = "Error adding domain";
+            }
+        } catch (InvalidArgumentException $exception) {
+            $error = $exception->getMessage();
         }
     }
 }
 
-// Generate CSRF token for logged-in users
-if (isset($_SESSION['logged_in']) && !isset($_SESSION['csrf_token'])) {
-    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-}
+// Always have a CSRF token, including on the login form.
+csrfToken();
 
-$currentIP = getCurrentIP();
+$currentIP = isLoggedIn() ? getCurrentIP() : 'Unknown';
 $intervalOptions = getIntervalOptions();
+$hasApiToken = configuredApiToken($config) !== '';
 ?>
 
 <!DOCTYPE html>
@@ -304,7 +253,7 @@ $intervalOptions = getIntervalOptions();
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title><?= isset($_SESSION['logged_in']) ? 'Cloudflare DynDNS Panel' : 'Login' ?></title>
+    <title><?= isLoggedIn() ? 'Cloudflare DynDNS Panel' : 'Login' ?></title>
     <link rel="icon" href="img/favicon.ico" type="image/x-icon">
     <style>
         * {
@@ -653,7 +602,7 @@ $intervalOptions = getIntervalOptions();
     </style>
 </head>
 <body>
-    <?php if (!isset($_SESSION['logged_in'])): ?>
+    <?php if (!isLoggedIn()): ?>
         <!-- Login Form -->
         <div class="container login-container">
             <div class="header">
@@ -665,16 +614,15 @@ $intervalOptions = getIntervalOptions();
                 <div class="alert alert-error"><?= htmlspecialchars($error) ?></div>
             <?php endif; ?>
 
-            <!-- Default password hint -->
-            <?php if ($config['password'] === password_hash('changeme', PASSWORD_DEFAULT) || password_verify('changeme', $config['password'])): ?>
+            <?php if (!empty($config['must_change_password'])): ?>
                 <div class="alert" style="background: #fff3cd; color: #856404; border: 1px solid #ffeaa7;">
                     <strong>⚠️ Initial Setup:</strong><br>
-                    Default password: <code>changeme</code><br>
-                    <small>Please change the password after first login!</small>
+                    <small>Use the deployment password. If none was supplied, read the generated value from <code>initial_password.txt</code> in the protected data directory. It must be changed before the panel can be used.</small>
                 </div>
             <?php endif; ?>
 
             <form method="POST">
+                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
                 <div class="form-group">
                     <label for="password">Password</label>
                     <input type="password" id="password" name="password" required>
@@ -708,22 +656,22 @@ $intervalOptions = getIntervalOptions();
 
             <!-- API Token Configuration -->
             <form method="POST">
-                <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
                 
                 <div class="form-group">
                     <label for="api_token">🔑 Cloudflare API Token</label>
                     <input type="password" id="api_token" name="api_token" 
-                           value="<?= htmlspecialchars($config['api_token']) ?>" 
-                           placeholder="Enter Cloudflare API Token">
+                           value="" autocomplete="new-password"
+                           placeholder="<?= $hasApiToken ? 'Token configured — enter a replacement' : 'Enter Cloudflare API Token' ?>">
                 </div>
 
-                <button type="submit" name="save_token" class="btn">💾 Save API Token</button>
+                <button type="submit" name="save_token" class="btn" <?= getenv('CLOUDFLARE_API_TOKEN') ? 'disabled' : '' ?>>💾 Verify &amp; Save API Token</button>
             </form>
 
             <!-- Update Interval Configuration -->
             <hr>
             <form method="POST">
-                <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
                 
                 <div class="form-group">
                     <label for="update_interval">⏰ Automatic Update Interval</label>
@@ -744,7 +692,7 @@ $intervalOptions = getIntervalOptions();
                         <p>Add this line to your crontab to enable automatic updates:</p>
                         <div class="cron-command" id="cron-command">
                             <?= htmlspecialchars(generateCronCommand($config['update_interval'], 'auto_update.php')) ?>
-                            <button type="button" class="copy-btn" onclick="copyToClipboard('cron-command')">Copy</button>
+                            <button type="button" class="copy-btn" data-copy-target="cron-command">Copy</button>
                         </div>
                         <p><small>Run <code>crontab -e</code> and paste the command above.</small></p>
                     </div>
@@ -772,13 +720,24 @@ $intervalOptions = getIntervalOptions();
                                 </div>
                             </div>
                             <div class="domain-actions">
-                                <a href="?toggle_domain=<?= $domain['id'] ?>" class="btn btn-small btn-secondary">
-                                    <?= $domain['enabled'] ? 'Disable' : 'Enable' ?>
-                                </a>
-                                <a href="edit_domain.php?id=<?= $domain['id'] ?>" class="btn btn-small btn-secondary">Edit</a>
-                                <a href="update.php?domain=<?= $domain['id'] ?>" class="btn btn-small btn-success">Update</a>
-                                <a href="?delete_domain=<?= $domain['id'] ?>" class="btn btn-small btn-danger" 
-                                   onclick="return confirm('Really delete domain?')">Delete</a>
+                                <form method="POST">
+                                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
+                                    <input type="hidden" name="domain_id" value="<?= htmlspecialchars((string) $domain['id'], ENT_QUOTES, 'UTF-8') ?>">
+                                    <button type="submit" name="domain_action" value="toggle" class="btn btn-small btn-secondary">
+                                        <?= $domain['enabled'] ? 'Disable' : 'Enable' ?>
+                                    </button>
+                                </form>
+                                <a href="edit_domain.php?id=<?= rawurlencode((string) $domain['id']) ?>" class="btn btn-small btn-secondary">Edit</a>
+                                <form method="POST" action="update.php">
+                                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
+                                    <input type="hidden" name="domain" value="<?= htmlspecialchars((string) $domain['id'], ENT_QUOTES, 'UTF-8') ?>">
+                                    <button type="submit" class="btn btn-small btn-success">Update</button>
+                                </form>
+                                <form method="POST" data-confirm="Really delete domain?">
+                                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
+                                    <input type="hidden" name="domain_id" value="<?= htmlspecialchars((string) $domain['id'], ENT_QUOTES, 'UTF-8') ?>">
+                                    <button type="submit" name="domain_action" value="delete" class="btn btn-small btn-danger">Delete</button>
+                                </form>
                             </div>
                         </div>
                     <?php endforeach; ?>
@@ -791,13 +750,13 @@ $intervalOptions = getIntervalOptions();
                     <h3>➕ Add New Domain</h3>
                     
                     <!-- Domain Browser -->
-                    <?php if (!empty($config['api_token'])): ?>
+                    <?php if ($hasApiToken): ?>
                         <div style="margin-bottom: 30px;">
                             <h4>🔍 Domain Browser (recommended)</h4>
                             <p style="color: #666; margin-bottom: 15px;">Browse your Cloudflare domains and add them with one click:</p>
                             
                             <div id="domain-browser">
-                                <button type="button" onclick="loadZones()" class="btn btn-secondary" id="load-zones-btn">
+                                <button type="button" class="btn btn-secondary" id="load-zones-btn">
                                     🌐 Load My Domains
                                 </button>
                                 <div id="zones-container" style="margin-top: 20px;"></div>
@@ -811,7 +770,7 @@ $intervalOptions = getIntervalOptions();
                     <?php endif; ?>
                     
                     <form method="POST">
-                        <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+                        <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
                         
                         <div class="form-row">
                             <div class="form-group">
@@ -846,19 +805,35 @@ $intervalOptions = getIntervalOptions();
 
             <!-- Actions -->
             <div style="margin-top: 40px; display: flex; gap: 15px; justify-content: center; flex-wrap: wrap;">
-                <a href="update.php" class="btn btn-success">🔄 Update All Active Domains</a>
+                <form method="POST" action="update.php">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
+                    <button type="submit" class="btn btn-success">🔄 Update All Active Domains</button>
+                </form>
                 <a href="logs.php" class="btn btn-secondary">📊 View Update Logs</a>
                 <a href="change_password.php" class="btn btn-secondary">🔑 Change Password</a>
             </div>
 
             <div class="logout-link">
-                <a href="?logout=1">Sign Out</a>
+                <form method="POST">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
+                    <button type="submit" name="logout" class="btn btn-small btn-danger">Sign Out</button>
+                </form>
             </div>
         </div>
     <?php endif; ?>
     
-    <script>
+    <script nonce="<?= htmlspecialchars($cspNonce, ENT_QUOTES, 'UTF-8') ?>">
 let zonesData = [];
+const csrfToken = <?= json_encode(csrfToken(), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
+
+function showMessage(container, message, isError = false) {
+    const element = document.createElement('div');
+    if (isError) {
+        element.className = 'alert alert-error';
+    }
+    element.textContent = message;
+    container.replaceChildren(element);
+}
 
 async function loadZones() {
     const btn = document.getElementById('load-zones-btn');
@@ -875,10 +850,10 @@ async function loadZones() {
             zonesData = data.zones;
             displayZones(data.zones);
         } else {
-            container.innerHTML = `<div class="alert alert-error">Error: ${data.error}</div>`;
+            showMessage(container, `Error: ${data.error}`, true);
         }
     } catch (error) {
-        container.innerHTML = `<div class="alert alert-error">Network error: ${error.message}</div>`;
+        showMessage(container, `Network error: ${error.message}`, true);
     }
     
     btn.textContent = '🔄 Reload';
@@ -893,45 +868,58 @@ function displayZones(zones) {
         return;
     }
     
-    let html = '<div class="zones-grid">';
-    
+    const grid = document.createElement('div');
+    grid.className = 'zones-grid';
     zones.forEach(zone => {
-        html += `
-            <div class="zone-card">
-                <h4>${zone.name}</h4>
-                <p><small>Zone ID: ${zone.id}</small></p>
-                <button type="button" onclick="loadRecords('${zone.id}', '${zone.name}')" 
-                        class="btn btn-small btn-secondary">
-                    📋 Show A Records
-                </button>
-                <div id="records-${zone.id}" class="records-container"></div>
-            </div>
-        `;
+        const card = document.createElement('div');
+        card.className = 'zone-card';
+        const heading = document.createElement('h4');
+        heading.textContent = zone.name;
+        const details = document.createElement('p');
+        const small = document.createElement('small');
+        small.textContent = `Zone ID: ${zone.id}`;
+        details.appendChild(small);
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'btn btn-small btn-secondary';
+        button.textContent = '📋 Show A Records';
+        button.addEventListener('click', () => loadRecords(zone.id));
+        const records = document.createElement('div');
+        records.id = `records-${zone.id}`;
+        records.className = 'records-container';
+        card.append(heading, details, button, records);
+        grid.appendChild(card);
     });
-    
-    html += '</div>';
-    container.innerHTML = html;
+    container.replaceChildren(grid);
 }
 
-async function loadRecords(zoneId, zoneName) {
+async function loadRecords(zoneId) {
     const container = document.getElementById(`records-${zoneId}`);
-    container.innerHTML = '<p>⏳ Loading records...</p>';
+    showMessage(container, '⏳ Loading records...');
     
     try {
-        const response = await fetch(`api_helper.php?action=get_records&zone_id=${zoneId}`);
+        const response = await fetch(`api_helper.php?action=get_records&zone_id=${encodeURIComponent(zoneId)}`);
         const data = await response.json();
         
         if (data.success) {
-            displayRecords(data.records, zoneId, zoneName);
+            displayRecords(data.records, zoneId);
         } else {
-            container.innerHTML = `<div class="alert alert-error">Error: ${data.error}</div>`;
+            showMessage(container, `Error: ${data.error}`, true);
         }
     } catch (error) {
-        container.innerHTML = `<div class="alert alert-error">Network error: ${error.message}</div>`;
+        showMessage(container, `Network error: ${error.message}`, true);
     }
 }
 
-function displayRecords(records, zoneId, zoneName) {
+function hiddenInput(name, value) {
+    const input = document.createElement('input');
+    input.type = 'hidden';
+    input.name = name;
+    input.value = value;
+    return input;
+}
+
+function displayRecords(records, zoneId) {
     const container = document.getElementById(`records-${zoneId}`);
     
     if (records.length === 0) {
@@ -939,31 +927,39 @@ function displayRecords(records, zoneId, zoneName) {
         return;
     }
     
-    let html = '<div class="records-list">';
-    
+    const list = document.createElement('div');
+    list.className = 'records-list';
     records.forEach(record => {
-        html += `
-            <div class="record-item">
-                <div class="record-info">
-                    <strong>${record.name}</strong><br>
-                    <small>IP: ${record.content} | Proxied: ${record.proxied ? 'Yes' : 'No'}</small>
-                </div>
-                <form method="POST" style="display: inline;">
-                    <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
-                    <input type="hidden" name="zone_id" value="${zoneId}">
-                    <input type="hidden" name="record_id" value="${record.id}">
-                    <input type="hidden" name="name" value="${record.name}">
-                    <input type="hidden" name="proxied" value="${record.proxied ? '1' : '0'}">
-                    <button type="submit" name="quick_add_domain" class="btn btn-small btn-success">
-                        ➕ Add
-                    </button>
-                </form>
-            </div>
-        `;
+        const item = document.createElement('div');
+        item.className = 'record-item';
+        const info = document.createElement('div');
+        info.className = 'record-info';
+        const name = document.createElement('strong');
+        name.textContent = record.name;
+        const lineBreak = document.createElement('br');
+        const details = document.createElement('small');
+        details.textContent = `IP: ${record.content} | Proxied: ${record.proxied ? 'Yes' : 'No'}`;
+        info.append(name, lineBreak, details);
+
+        const form = document.createElement('form');
+        form.method = 'POST';
+        form.append(
+            hiddenInput('csrf_token', csrfToken),
+            hiddenInput('zone_id', zoneId),
+            hiddenInput('record_id', record.id),
+            hiddenInput('name', record.name),
+            hiddenInput('proxied', record.proxied ? '1' : '0')
+        );
+        const add = document.createElement('button');
+        add.type = 'submit';
+        add.name = 'quick_add_domain';
+        add.className = 'btn btn-small btn-success';
+        add.textContent = '➕ Add';
+        form.appendChild(add);
+        item.append(info, form);
+        list.appendChild(item);
     });
-    
-    html += '</div>';
-    container.innerHTML = html;
+    container.replaceChildren(list);
 }
 
 function copyToClipboard(elementId) {
@@ -998,6 +994,21 @@ function copyToClipboard(elementId) {
         }, 2000);
     });
 }
+
+const loadZonesButton = document.getElementById('load-zones-btn');
+if (loadZonesButton) {
+    loadZonesButton.addEventListener('click', loadZones);
+}
+document.querySelectorAll('[data-copy-target]').forEach(button => {
+    button.addEventListener('click', () => copyToClipboard(button.dataset.copyTarget));
+});
+document.querySelectorAll('form[data-confirm]').forEach(form => {
+    form.addEventListener('submit', event => {
+        if (!window.confirm(form.dataset.confirm)) {
+            event.preventDefault();
+        }
+    });
+});
 </script>
 </body>
 </html>

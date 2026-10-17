@@ -1,0 +1,39 @@
+name: Security checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  php-security:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php: ['7.4', '8.2']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@db91e1a0e48e84637d325a7ee4d2677e146ceec4 # 2.36.0
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+
+      - name: Lint PHP
+        run: find . -type f -name '*.php' -not -path './data/*' -print0 | xargs -0 -n1 php -l
+
+      - name: Run security regressions
+        run: php tests/security_test.php
+
+      - name: Check shell scripts
+        run: bash -n docker-entrypoint.sh helper-script.sh
+
+      - name: Build hardened container
+        if: matrix.php == '8.2'
+        run: docker build --tag cloudflare-dyndns-panel:test .

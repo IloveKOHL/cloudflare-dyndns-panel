@@ -1,41 +1,41 @@
 <?php
-session_start();
-if (!isset($_SESSION['logged_in'])) {
-    die("Not logged in!");
-}
+declare(strict_types=1);
 
-// Load configuration
-function loadConfig() {
-    if (!file_exists('config.json')) {
-        return ['password' => password_hash('changeme', PASSWORD_DEFAULT)];
-    }
-    return json_decode(file_get_contents('config.json'), true);
-}
+require_once __DIR__ . '/bootstrap.php';
 
-// Save configuration
-function saveConfig($config) {
-    return file_put_contents('config.json', json_encode($config, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-}
+startSecureSession();
+requireLogin();
+$cspNonce = cspNonce();
 
 $config = loadConfig();
 $error = '';
 $success = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $oldPassword = isset($_POST['old']) && is_string($_POST['old']) ? $_POST['old'] : '';
+    $newPassword = isset($_POST['new']) && is_string($_POST['new']) ? $_POST['new'] : '';
+    $confirmation = isset($_POST['confirm']) && is_string($_POST['confirm']) ? $_POST['confirm'] : '';
     // CSRF protection
-    if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+    if (!verifyCsrfToken($_POST['csrf_token'] ?? null)) {
         $error = "Invalid request";
-    } elseif (empty($_POST['old']) || empty($_POST['new']) || empty($_POST['confirm'])) {
+    } elseif ($oldPassword === '' || $newPassword === '' || $confirmation === '') {
         $error = "All fields must be filled";
-    } elseif (!password_verify($_POST['old'], $config['password'])) {
+    } elseif (!password_verify($oldPassword, $config['password'])) {
         $error = "Current password is incorrect";
-    } elseif ($_POST['new'] !== $_POST['confirm']) {
+    } elseif ($newPassword !== $confirmation) {
         $error = "New passwords do not match";
-    } elseif (strlen($_POST['new']) < 6) {
-        $error = "New password must be at least 6 characters long";
+    } elseif (strlen($newPassword) < 12) {
+        $error = "New password must be at least 12 characters long";
     } else {
-        $config['password'] = password_hash($_POST['new'], PASSWORD_DEFAULT);
+        $config['password'] = password_hash($newPassword, PASSWORD_DEFAULT);
+        $config['must_change_password'] = false;
         if (saveConfig($config)) {
+            $initialPasswordFile = dataPath('initial_password.txt');
+            if (is_file($initialPasswordFile)) {
+                @unlink($initialPasswordFile);
+            }
+            session_regenerate_id(true);
+            $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
             $success = "Password changed successfully!";
         } else {
             $error = "Error saving new password";
@@ -43,10 +43,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// Generate CSRF token
-if (!isset($_SESSION['csrf_token'])) {
-    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-}
+csrfToken();
 ?>
 
 <!DOCTYPE html>
@@ -224,28 +221,28 @@ if (!isset($_SESSION['csrf_token'])) {
         <div class="password-requirements">
             <h4>📋 Password Requirements:</h4>
             <ul>
-                <li>At least 6 characters long</li>
+                <li>At least 12 characters long</li>
                 <li>Use a combination of letters, numbers and special characters</li>
                 <li>Avoid simple words or personal information</li>
             </ul>
         </div>
 
         <form method="POST">
-            <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
             
             <div class="form-group">
                 <label for="old">Current Password</label>
-                <input type="password" id="old" name="old" required>
+                <input type="password" id="old" name="old" required autocomplete="current-password">
             </div>
 
             <div class="form-group">
                 <label for="new">New Password</label>
-                <input type="password" id="new" name="new" required minlength="6">
+                <input type="password" id="new" name="new" required minlength="12" autocomplete="new-password">
             </div>
 
             <div class="form-group">
                 <label for="confirm">Confirm New Password</label>
-                <input type="password" id="confirm" name="confirm" required minlength="6">
+                <input type="password" id="confirm" name="confirm" required minlength="12" autocomplete="new-password">
             </div>
 
             <button type="submit" class="btn">💾 Change Password</button>
@@ -256,7 +253,7 @@ if (!isset($_SESSION['csrf_token'])) {
         </div>
     </div>
 
-    <script>
+    <script nonce="<?= htmlspecialchars($cspNonce, ENT_QUOTES, 'UTF-8') ?>">
         // Password confirmation validation
         document.getElementById('confirm').addEventListener('input', function() {
             const newPassword = document.getElementById('new').value;

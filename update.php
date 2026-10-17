@@ -1,86 +1,41 @@
 <?php
-session_start();
-if (!isset($_SESSION['logged_in'])) {
-    die("Not logged in!");
-}
+declare(strict_types=1);
 
-// Load configuration
-function loadConfig() {
-    if (!file_exists('config.json')) {
-        return ['api_token' => '', 'domains' => []];
-    }
-    return json_decode(file_get_contents('config.json'), true);
-}
+require_once __DIR__ . '/bootstrap.php';
+require_once __DIR__ . '/cloudflare_api.php';
 
-// Save configuration
-function saveConfig($config) {
-    return file_put_contents('config.json', json_encode($config, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+startSecureSession();
+requireLogin();
+
+if ($_SERVER['REQUEST_METHOD'] !== 'POST' || !verifyCsrfToken($_POST['csrf_token'] ?? null)) {
+    http_response_code(405);
+    header('Allow: POST');
+    exit('Invalid request');
 }
 
 // Get current IP
 function getCurrentIP() {
-    $ip = @file_get_contents("https://api.ipify.org");
-    return $ip ?: false;
-}
-
-// Update DNS record
-function updateDNSRecord($apiToken, $zoneId, $recordId, $name, $ip, $proxied = false) {
-    $url = "https://api.cloudflare.com/client/v4/zones/$zoneId/dns_records/$recordId";
-    $data = [
-        "type" => "A",
-        "name" => $name,
-        "content" => $ip,
-        "ttl" => 120,
-        "proxied" => $proxied
-    ];
-
-    $options = [
-        "http" => [
-            "header" => [
-                "Authorization: Bearer $apiToken",
-                "Content-Type: application/json"
-            ],
-            "method" => "PUT",
-            "content" => json_encode($data)
-        ]
-    ];
-    
-    $context = stream_context_create($options);
-    $result = @file_get_contents($url, false, $context);
-    
-    if ($result) {
-        return json_decode($result, true);
+    $services = ['https://api.ipify.org', 'https://ipv4.icanhazip.com', 'https://checkip.amazonaws.com'];
+    $context = stream_context_create(['http' => ['timeout' => 10, 'max_redirects' => 0]]);
+    $detected = [];
+    foreach ($services as $service) {
+        $ip = @file_get_contents($service, false, $context, 0, 64);
+        $ip = $ip === false ? '' : trim($ip);
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false) {
+            $detected[] = $ip;
+        }
     }
-    
-    return ['success' => false, 'errors' => [['message' => 'Network error']]];
-}
-
-// Log update
-function logUpdate($domain, $ip, $success, $error = '') {
-    $logEntry = [
-        'timestamp' => date('Y-m-d H:i:s'),
-        'domain' => $domain,
-        'ip' => $ip,
-        'success' => $success,
-        'error' => $error
-    ];
-    
-    $logFile = 'update_log.json';
-    $logs = [];
-    
-    if (file_exists($logFile)) {
-        $logs = json_decode(file_get_contents($logFile), true) ?: [];
+    if (!$detected) {
+        return false;
     }
-    
-    array_unshift($logs, $logEntry);
-    
-    // Keep only last 100 entries
-    $logs = array_slice($logs, 0, 100);
-    
-    file_put_contents($logFile, json_encode($logs, JSON_PRETTY_PRINT));
+    $counts = array_count_values($detected);
+    arsort($counts);
+    $ip = (string) array_key_first($counts);
+    return $counts[$ip] >= 2 ? $ip : false;
 }
 
 $config = loadConfig();
+requirePasswordChangeComplete($config);
 $results = [];
 $currentIP = getCurrentIP();
 
@@ -88,53 +43,65 @@ if (!$currentIP) {
     die("❌ Error: Could not determine current IP address");
 }
 
-if (empty($config['api_token'])) {
+if (configuredApiToken($config) === '') {
     die("❌ Error: No API token configured");
 }
 
 // Check if specific domain should be updated
-$specificDomain = isset($_GET['domain']) ? $_GET['domain'] : null;
+$specificDomain = isset($_POST['domain']) && is_string($_POST['domain']) ? $_POST['domain'] : null;
+if ($specificDomain !== null && !preg_match('/^[a-f0-9]{13,32}$/i', $specificDomain)) {
+    http_response_code(400);
+    exit('Invalid domain ID');
+}
 
 if (isset($config['domains']) && !empty($config['domains'])) {
     foreach ($config['domains'] as $domain) {
+        if (!is_array($domain) || !isset($domain['id'], $domain['zone_id'], $domain['record_id'], $domain['name'])) {
+            continue;
+        }
         // Skip if specific domain requested and this isn't it
-        if ($specificDomain && $domain['id'] !== $specificDomain) {
+        if ($specificDomain && !hash_equals((string) $domain['id'], $specificDomain)) {
             continue;
         }
         
         // Skip disabled domains (unless specifically requested)
-        if (!$domain['enabled'] && !$specificDomain) {
+        if (empty($domain['enabled']) && !$specificDomain) {
             continue;
         }
         
         $response = updateDNSRecord(
-            $config['api_token'],
-            $domain['zone_id'],
-            $domain['record_id'],
-            $domain['name'],
+            configuredApiToken($config),
+            (string) $domain['zone_id'],
+            (string) $domain['record_id'],
+            (string) $domain['name'],
             $currentIP,
-            $domain['proxied']
+            !empty($domain['proxied'])
         );
         
         $success = $response['success'] ?? false;
         $error = '';
         
-        if (!$success && isset($response['errors'])) {
-            $error = implode(', ', array_column($response['errors'], 'message'));
+        if (!$success) {
+            $error = cloudflareErrors($response);
         }
         
         $results[] = [
-            'domain' => $domain['name'],
-            'success' => $success,
+            'domain' => (string) $domain['name'],
+            'success' => (bool) $success,
             'error' => $error,
-            'proxied' => $domain['proxied']
+            'proxied' => !empty($domain['proxied'])
         ];
         
         // Log the update
-        logUpdate($domain['name'], $currentIP, $success, $error);
+        logUpdate((string) $domain['name'], $currentIP, (bool) $success, $error, false);
     }
 } else {
     die("❌ Error: No domains configured");
+}
+
+if (!$results) {
+    http_response_code(404);
+    die("❌ Error: Domain not found or no active domains configured");
 }
 ?>
 

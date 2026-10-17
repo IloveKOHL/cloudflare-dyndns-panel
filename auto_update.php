@@ -1,231 +1,134 @@
 <?php
+declare(strict_types=1);
+
 // Automatic DNS Update Script for Cron Jobs
-// This script runs independently without web sessions
-
-// Prevent direct web access - only allow command line execution
-if (isset($_SERVER['HTTP_HOST'])) {
+if (PHP_SAPI !== 'cli') {
     http_response_code(403);
-    die("Error: This script can only be executed from command line or cron job.\n");
+    die("Error: This script can only be executed from command line or cron.\n");
 }
 
-// Change to script directory to ensure relative paths work
-chdir(dirname(__FILE__));
+require_once __DIR__ . '/bootstrap.php';
+require_once __DIR__ . '/cloudflare_api.php';
 
-// Load configuration directly from file
-function loadConfig() {
-    if (!file_exists('config.json')) {
-        return null;
-    }
-    
-    $config = json_decode(file_get_contents('config.json'), true);
-    
-    // Validate config structure
-    if (!$config || !is_array($config)) {
-        return null;
-    }
-    
-    // Check required fields
-    if (!isset($config['api_token']) || !isset($config['domains'])) {
-        return null;
-    }
-    
-    return $config;
+$processLock = @fopen(dataPath('auto_update.lock'), 'c+');
+if ($processLock === false || !flock($processLock, LOCK_EX | LOCK_NB)) {
+    fwrite(STDERR, "Another automatic update is already running.\n");
+    exit(0);
 }
 
-// Get current IP
-function getCurrentIP() {
+function getCurrentIP()
+{
     $services = [
         'https://api.ipify.org',
         'https://ipv4.icanhazip.com',
         'https://checkip.amazonaws.com',
-        'https://ipinfo.io/ip'
+        'https://ipinfo.io/ip',
     ];
-    
+    $context = stream_context_create(['http' => ['timeout' => 10, 'max_redirects' => 0]]);
+    $detected = [];
+
     foreach ($services as $service) {
-        $ip = @file_get_contents($service);
-        if ($ip && filter_var(trim($ip), FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-            return trim($ip);
+        $ip = @file_get_contents($service, false, $context, 0, 64);
+        $ip = $ip === false ? '' : trim($ip);
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false) {
+            $detected[] = $ip;
         }
     }
-    
-    return false;
+
+    if (!$detected) {
+        return false;
+    }
+
+    $counts = array_count_values($detected);
+    arsort($counts);
+    $ip = (string) array_key_first($counts);
+    return $counts[$ip] >= 2 ? $ip : false;
 }
 
-// Update DNS record via Cloudflare API
-function updateDNSRecord($apiToken, $zoneId, $recordId, $name, $ip, $proxied = false) {
-    $url = "https://api.cloudflare.com/client/v4/zones/$zoneId/dns_records/$recordId";
-    $data = [
-        "type" => "A",
-        "name" => $name,
-        "content" => $ip,
-        "ttl" => 120,
-        "proxied" => $proxied
-    ];
-
-    $options = [
-        "http" => [
-            "header" => [
-                "Authorization: Bearer $apiToken",
-                "Content-Type: application/json",
-                "User-Agent: CloudflareDynDNS/1.0"
-            ],
-            "method" => "PUT",
-            "content" => json_encode($data),
-            "timeout" => 30
-        ]
-    ];
-    
-    $context = stream_context_create($options);
-    $result = @file_get_contents($url, false, $context);
-    
-    if ($result === false) {
-        return ['success' => false, 'errors' => [['message' => 'Network error or timeout']]];
-    }
-    
-    $response = json_decode($result, true);
-    if (!$response) {
-        return ['success' => false, 'errors' => [['message' => 'Invalid API response']]];
-    }
-    
-    return $response;
-}
-
-// Log update with timestamp
-function logUpdate($domain, $ip, $success, $error = '', $auto = true) {
-    $logEntry = [
-        'timestamp' => date('Y-m-d H:i:s'),
-        'domain' => $domain,
-        'ip' => $ip,
-        'success' => $success,
-        'error' => $error,
-        'automatic' => $auto
-    ];
-    
-    $logFile = 'update_log.json';
-    $logs = [];
-    
-    if (file_exists($logFile)) {
-        $content = file_get_contents($logFile);
-        if ($content) {
-            $logs = json_decode($content, true) ?: [];
-        }
-    }
-    
-    array_unshift($logs, $logEntry);
-    
-    // Keep only last 100 entries
-    $logs = array_slice($logs, 0, 100);
-    
-    file_put_contents($logFile, json_encode($logs, JSON_PRETTY_PRINT));
-}
-
-// Check if IP has changed since last update
-function hasIPChanged($currentIP) {
-    $lastIPFile = 'last_ip.txt';
-    
-    if (!file_exists($lastIPFile)) {
-        file_put_contents($lastIPFile, $currentIP);
+function hasIPChanged(string $currentIP): bool
+{
+    $path = dataPath('last_ip.txt');
+    if (!is_file($path)) {
         return true;
     }
-    
-    $lastIP = trim(file_get_contents($lastIPFile));
-    
-    if ($lastIP !== $currentIP) {
-        file_put_contents($lastIPFile, $currentIP);
-        return true;
-    }
-    
-    return false;
+    $lastIP = @file_get_contents($path);
+    return $lastIP === false || trim($lastIP) !== $currentIP;
 }
 
-// Validate update interval timing
-function shouldRunUpdate($interval) {
-    $lastRunFile = 'last_run.txt';
+function shouldRunUpdate(string $interval): bool
+{
+    $seconds = [
+        '5min' => 300,
+        '15min' => 900,
+        '30min' => 1800,
+        '1hour' => 3600,
+        '6hours' => 21600,
+        '12hours' => 43200,
+        'daily' => 86400,
+    ];
+    if (!isset($seconds[$interval])) {
+        return false;
+    }
+
+    $path = dataPath('last_run.txt');
     $now = time();
-    
-    if (!file_exists($lastRunFile)) {
-        file_put_contents($lastRunFile, $now);
-        return true;
+    $lastRun = is_file($path) ? (int) @file_get_contents($path) : 0;
+    if (($now - $lastRun) < $seconds[$interval]) {
+        return false;
     }
-    
-    $lastRun = intval(file_get_contents($lastRunFile));
-    $timeDiff = $now - $lastRun;
-    
-    // Define minimum intervals in seconds
-    $intervals = [
-        '5min' => 300,      // 5 minutes
-        '15min' => 900,     // 15 minutes
-        '30min' => 1800,    // 30 minutes
-        '1hour' => 3600,    // 1 hour
-        '6hours' => 21600,  // 6 hours
-        '12hours' => 43200, // 12 hours
-        'daily' => 86400    // 24 hours
-    ];
-    
-    $minInterval = $intervals[$interval] ?? 0;
-    
-    if ($timeDiff >= $minInterval) {
-        file_put_contents($lastRunFile, $now);
-        return true;
-    }
-    
-    return false;
+
+    return atomicWrite($path, (string) $now . "\n");
 }
 
-// Main execution starts here
-echo "[" . date('Y-m-d H:i:s') . "] Starting automatic DNS update check...\n";
+function cliDomainName(array $domain): string
+{
+    $name = isset($domain['name']) && is_string($domain['name']) ? $domain['name'] : 'unknown';
+    return str_replace(["\r", "\n"], '', $name);
+}
 
-// Load configuration
-$config = loadConfig();
+echo '[' . date('Y-m-d H:i:s') . "] Starting automatic DNS update check...\n";
 
-if (!$config) {
-    echo "[" . date('Y-m-d H:i:s') . "] ERROR: No valid configuration file found\n";
-    echo "Make sure config.json exists and contains valid configuration.\n";
+try {
+    $config = loadConfig();
+} catch (Throwable $exception) {
+    fwrite(STDERR, '[' . date('Y-m-d H:i:s') . '] ERROR: ' . $exception->getMessage() . "\n");
     exit(1);
 }
 
-// Check if automatic updates are enabled
-if (!isset($config['update_interval']) || $config['update_interval'] === 'manual') {
-    echo "[" . date('Y-m-d H:i:s') . "] INFO: Automatic updates disabled (manual mode)\n";
+$interval = isset($config['update_interval']) ? (string) $config['update_interval'] : 'manual';
+if ($interval === 'manual') {
+    echo '[' . date('Y-m-d H:i:s') . "] INFO: Automatic updates disabled (manual mode)\n";
     exit(0);
 }
-
-// Check if we should run based on interval
-if (!shouldRunUpdate($config['update_interval'])) {
-    echo "[" . date('Y-m-d H:i:s') . "] INFO: Update interval not reached, skipping\n";
-    exit(0);
-}
-
-// Validate API token
-if (empty($config['api_token'])) {
-    echo "[" . date('Y-m-d H:i:s') . "] ERROR: No API token configured\n";
-    echo "Please configure your Cloudflare API token in the web panel.\n";
+if (!in_array($interval, allowedUpdateIntervals(), true)) {
+    fwrite(STDERR, '[' . date('Y-m-d H:i:s') . "] ERROR: Invalid update interval\n");
     exit(1);
 }
 
-// Get current IP address
-echo "[" . date('Y-m-d H:i:s') . "] Getting current IP address...\n";
+$apiToken = configuredApiToken($config);
+if ($apiToken === '') {
+    fwrite(STDERR, '[' . date('Y-m-d H:i:s') . "] ERROR: No API token configured\n");
+    exit(1);
+}
+if (empty($config['domains'])) {
+    echo '[' . date('Y-m-d H:i:s') . "] WARNING: No domains configured\n";
+    exit(0);
+}
+if (!shouldRunUpdate($interval)) {
+    echo '[' . date('Y-m-d H:i:s') . "] INFO: Update interval not reached, skipping\n";
+    exit(0);
+}
+
+echo '[' . date('Y-m-d H:i:s') . "] Getting current IP address from multiple services...\n";
 $currentIP = getCurrentIP();
-
-if (!$currentIP) {
-    echo "[" . date('Y-m-d H:i:s') . "] ERROR: Could not determine current IP address\n";
-    echo "Tried multiple IP detection services, all failed.\n";
+if ($currentIP === false) {
+    fwrite(STDERR, '[' . date('Y-m-d H:i:s') . "] ERROR: IP services did not agree on a valid IPv4 address\n");
     exit(1);
 }
 
-echo "[" . date('Y-m-d H:i:s') . "] Current IP: $currentIP\n";
-
-// Check if IP has changed (optimization)
+echo '[' . date('Y-m-d H:i:s') . "] Current IP: {$currentIP}\n";
 if (!hasIPChanged($currentIP)) {
-    echo "[" . date('Y-m-d H:i:s') . "] INFO: IP address unchanged, skipping update\n";
-    exit(0);
-}
-
-echo "[" . date('Y-m-d H:i:s') . "] IP address changed, updating DNS records...\n";
-
-// Check if domains are configured
-if (!isset($config['domains']) || empty($config['domains'])) {
-    echo "[" . date('Y-m-d H:i:s') . "] WARNING: No domains configured\n";
+    echo '[' . date('Y-m-d H:i:s') . "] INFO: IP address unchanged, skipping update\n";
     exit(0);
 }
 
@@ -233,68 +136,46 @@ $updateCount = 0;
 $errorCount = 0;
 $skippedCount = 0;
 
-// Process each domain
 foreach ($config['domains'] as $domain) {
-    // Skip disabled domains
-    if (!isset($domain['enabled']) || !$domain['enabled']) {
-        echo "[" . date('Y-m-d H:i:s') . "] INFO: Skipping disabled domain: {$domain['name']}\n";
+    if (!is_array($domain)) {
+        $errorCount++;
+        continue;
+    }
+    $displayName = cliDomainName($domain);
+    if (empty($domain['enabled'])) {
+        echo '[' . date('Y-m-d H:i:s') . "] INFO: Skipping disabled domain: {$displayName}\n";
         $skippedCount++;
         continue;
     }
-    
-    // Validate domain configuration
-    if (!isset($domain['zone_id']) || !isset($domain['record_id']) || !isset($domain['name'])) {
-        echo "[" . date('Y-m-d H:i:s') . "] ERROR: Invalid domain configuration for: " . ($domain['name'] ?? 'unknown') . "\n";
+
+    $zoneId = isset($domain['zone_id']) ? (string) $domain['zone_id'] : '';
+    $recordId = isset($domain['record_id']) ? (string) $domain['record_id'] : '';
+    $name = isset($domain['name']) ? (string) $domain['name'] : '';
+    if (!validateCloudflareId($zoneId) || !validateCloudflareId($recordId) || !validateDomainName($name)) {
+        echo '[' . date('Y-m-d H:i:s') . "] ERROR: Invalid domain configuration for: {$displayName}\n";
         $errorCount++;
         continue;
     }
-    
-    echo "[" . date('Y-m-d H:i:s') . "] Updating {$domain['name']}...\n";
-    
-    // Perform DNS update
-    $response = updateDNSRecord(
-        $config['api_token'],
-        $domain['zone_id'],
-        $domain['record_id'],
-        $domain['name'],
-        $currentIP,
-        $domain['proxied'] ?? false
-    );
-    
-    $success = $response['success'] ?? false;
-    $error = '';
-    
+
+    echo '[' . date('Y-m-d H:i:s') . "] Updating {$displayName}...\n";
+    $response = updateDNSRecord($apiToken, $zoneId, $recordId, $name, $currentIP, !empty($domain['proxied']));
+    $success = !empty($response['success']);
+    $error = $success ? '' : cloudflareErrors($response);
+
     if ($success) {
-        echo "[" . date('Y-m-d H:i:s') . "] SUCCESS: {$domain['name']} updated to $currentIP\n";
+        echo '[' . date('Y-m-d H:i:s') . "] SUCCESS: {$displayName} updated to {$currentIP}\n";
         $updateCount++;
     } else {
-        if (isset($response['errors']) && is_array($response['errors'])) {
-            $error = implode(', ', array_column($response['errors'], 'message'));
-        } else {
-            $error = 'Unknown API error';
-        }
-        echo "[" . date('Y-m-d H:i:s') . "] ERROR: Failed to update {$domain['name']}: $error\n";
+        echo '[' . date('Y-m-d H:i:s') . "] ERROR: Failed to update {$displayName}: {$error}\n";
         $errorCount++;
     }
-    
-    // Log the update attempt
-    logUpdate($domain['name'], $currentIP, $success, $error, true);
-    
-    // Small delay between updates to be nice to the API
-    if (count($config['domains']) > 1) {
-        usleep(500000); // 0.5 seconds
-    }
+    logUpdate($name, $currentIP, $success, $error, true);
 }
 
-// Summary
-echo "[" . date('Y-m-d H:i:s') . "] Update completed\n";
-echo "[" . date('Y-m-d H:i:s') . "] Summary: $updateCount successful, $errorCount failed, $skippedCount skipped\n";
-
-if ($errorCount > 0) {
-    echo "[" . date('Y-m-d H:i:s') . "] WARNING: Some updates failed, check logs for details\n";
+if ($errorCount === 0 && $updateCount > 0 && !atomicWrite(dataPath('last_ip.txt'), $currentIP . "\n")) {
+    fwrite(STDERR, '[' . date('Y-m-d H:i:s') . "] ERROR: DNS updated but last IP state could not be saved\n");
     exit(1);
 }
 
-echo "[" . date('Y-m-d H:i:s') . "] All updates completed successfully\n";
-exit(0);
-?>
+echo '[' . date('Y-m-d H:i:s') . "] Summary: {$updateCount} successful, {$errorCount} failed, {$skippedCount} skipped\n";
+exit($errorCount > 0 ? 1 : 0);

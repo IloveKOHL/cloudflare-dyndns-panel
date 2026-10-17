@@ -1,4 +1,12 @@
 config.json
+update_log.json
+last_ip.txt
+last_run.txt
+initial_password.txt
+data/
+.git/
+.github/
+tests/
 helper-script.sh
 LICENSE
 README.md

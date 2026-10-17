@@ -63,16 +63,29 @@ docker pull ghcr.io/ilovekohl/cloudflare-dyndns-panel:latest
 
 #### 2. Run the container
 
+Create a local environment file first (keep it out of version control):
+
 ```bash
+cat > panel.env <<'EOF'
+DYNDNS_INITIAL_PASSWORD=replace-with-a-strong-unique-password
+# Optional and preferred over saving the token through the UI:
+# CLOUDFLARE_API_TOKEN=replace-with-your-restricted-token
+# Set this when a trusted reverse proxy terminates HTTPS:
+# DYNDNS_FORCE_HTTPS=true
+EOF
+chmod 600 panel.env
+
 docker run -d \
   --name cloudflare-dyndns-panel \
-  -p 8080:80 \
-   ghcr.io/ilovekohl/cloudflare-dyndns-panel:latest
+  --env-file panel.env \
+  -p 127.0.0.1:8080:80 \
+  -v cloudflare-dyndns-data:/var/lib/cloudflare-dyndns-panel \
+  ghcr.io/ilovekohl/cloudflare-dyndns-panel:latest
 ```
 
-- The panel will be available at [http://localhost:8080](http://localhost:8080)
-- Adjust the port (`8080:80`) as needed.
-- If you want persistent data, mount volumes for the configuration and log files.
+- The panel will be available at [http://localhost:8080](http://localhost:8080). Put it behind HTTPS before exposing it beyond localhost.
+- The named volume persists the protected configuration and logs outside the Apache document root.
+- If `DYNDNS_INITIAL_PASSWORD` is omitted, the container generates one and prints it once in `docker logs cloudflare-dyndns-panel`.
 
 #### 3. (Optional) Set up a cron job for automatic updates
 
@@ -103,13 +116,20 @@ crontab -e
    cd cloudflare-dyndns-panel
    ```
 
-2. **Set proper permissions**:
+2. **Create a protected data directory**:
    ```bash
-   chmod 755 *.php
-   sudo chown -R www-data:www-data /var/www/html
-   sudo chmod -R 755 /var/www/html
-   chmod 666 config.json  # Will be created automatically
+   sudo install -d -o www-data -g www-data -m 700 /var/lib/cloudflare-dyndns-panel
    ```
+
+   Install the included Apache policy and configure the same data directory for Apache/PHP and cron:
+
+   ```bash
+   sudo cp docker/apache-security.conf /etc/apache2/conf-available/dyndns-security.conf
+   sudo a2enconf dyndns-security
+   sudo systemctl reload apache2
+   ```
+
+   Linux defaults to `/var/lib/cloudflare-dyndns-panel`; `DYNDNS_DATA_DIR` can override it with another absolute, non-public path. The generated cron command carries the configured path forward.
 
 3. **Access the panel** in your web browser:
    ```
@@ -117,8 +137,8 @@ crontab -e
    ```
 
 4. **First login**:
-   - Default password: `changeme`
-   - **Change the password immediately** after first login!
+   - Set `DYNDNS_INITIAL_PASSWORD` (12+ characters) before the first request, or read the generated password from `initial_password.txt` in the protected data directory.
+   - Change the initial password immediately; the one-time password file is then removed.
 
 ## 🔑 Cloudflare API Token Setup
 
@@ -138,7 +158,7 @@ Permissions:
 - Zone:DNS:Edit
 
 Zone Resources:
-- Include:All zones (or specific zones)
+- Include only the zones this panel must update
 
 Client IP Address Filtering:
 - (Optional) Your server's IP
@@ -153,7 +173,7 @@ Client IP Address Filtering:
 
 ### Initial Setup
 
-1. **Login** with default password `changeme`
+1. **Login** with the deployment-specific initial password
 2. **Change password** immediately
 3. **Add your Cloudflare API token**
 4. **Choose update interval** (or keep manual)
@@ -190,21 +210,22 @@ Example cron command for 15-minute updates:
 
 ```
 cloudflare-dyndns-panel/
+├── bootstrap.php          # Secure sessions and protected storage
+├── cloudflare_api.php     # Bounded Cloudflare API client
 ├── index.php              # Main panel interface
 ├── update.php              # Manual update script
 ├── auto_update.php         # Automatic update script (for cron)
 ├── change_password.php     # Password change interface
 ├── logs.php               # Update logs viewer
 ├── api_helper.php         # API communication helper
-├── config.json            # Configuration file (auto-created)
-├── update_log.json        # Update logs (auto-created)
-├── last_ip.txt           # Last known IP (auto-created)
 └── README.md              # This file
 ```
 
+Runtime files live in `DYNDNS_DATA_DIR` (Docker: `/var/lib/cloudflare-dyndns-panel`), not in the public web directory.
+
 ## ⚙️ Configuration
 
-The `config.json` file stores all settings:
+The protected `config.json` file stores the settings. Prefer `CLOUDFLARE_API_TOKEN` so the token is supplied by the deployment secret mechanism instead of being persisted by the panel:
 
 ```json
 {
@@ -233,13 +254,13 @@ If PHP is not in `/usr/bin/php`, edit the cron command:
 ```
 
 ### Logging
-- **Update logs**: Stored in `update_log.json`
+- **Update logs**: Stored as `update_log.json` inside `DYNDNS_DATA_DIR`
 - **Last 100 entries** kept automatically
 - **View in panel**: Go to "View Update Logs"
 
 ### IP Change Detection
 The system only updates DNS when your IP actually changes:
-- Current IP stored in `last_ip.txt`
+- Current IP stored in `last_ip.txt` inside `DYNDNS_DATA_DIR`
 - Saves API calls and reduces logs
 - Can be disabled by deleting the file
 
@@ -273,19 +294,21 @@ php auto_update.php
 ## 🔒 Security Considerations
 
 ### Best Practices
-- **Change default password** immediately
-- **Use strong passwords** (8+ characters, mixed case, numbers, symbols)
-- **Restrict file permissions**: `chmod 600 config.json`
+- **Change the generated initial password** immediately
+- **Use a strong, unique password** (12+ characters)
+- **Keep `DYNDNS_DATA_DIR` outside the document root** with directory mode `0700` and files mode `0600`
 - **Use HTTPS** for the web interface
-- **Regular token rotation** (every 6-12 months)
+- **Use a restricted Cloudflare token** scoped only to the required zones and rotate it regularly
+- **Do not expose port 80 directly**; bind to localhost and use a trusted HTTPS reverse proxy
 
 ### File Permissions
 ```bash
-chmod 755 *.php           # PHP files
-chmod 600 config.json     # Configuration (sensitive)
-chmod 644 *.json          # Other JSON files
-chmod 644 *.txt           # Text files
+sudo chown -R www-data:www-data /var/lib/cloudflare-dyndns-panel
+sudo chmod 700 /var/lib/cloudflare-dyndns-panel
+sudo chmod 600 /var/lib/cloudflare-dyndns-panel/*
 ```
+
+On upgrade, legacy `config.json`, `update_log.json`, `last_ip.txt`, and `last_run.txt` files are migrated out of the web directory automatically. Back up the data directory before upgrading.
 
 ## 📊 Monitoring
 
@@ -296,7 +319,7 @@ chmod 644 *.txt           # Text files
 
 ### Log Rotation
 - **Automatic**: Keeps last 100 entries
-- **Manual cleanup**: Delete `update_log.json` to reset
+- **Manual cleanup**: Use the CSRF-protected **Clear Logs** button
 
 ## 🤝 Contributing
 

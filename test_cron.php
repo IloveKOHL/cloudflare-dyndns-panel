@@ -1,249 +1,67 @@
 <?php
-// Test script to verify cron setup and configuration
-// Run this manually to test your setup: php test_cron.php
+declare(strict_types=1);
 
-// Prevent web access
-if (isset($_SERVER['HTTP_HOST'])) {
+if (PHP_SAPI !== 'cli') {
     http_response_code(403);
     die("This script can only be executed from command line.\n");
 }
 
+require_once __DIR__ . '/bootstrap.php';
+
 echo "=== Cloudflare DynDNS Cron Test ===\n\n";
+$failed = false;
 
-// Change to script directory
-chdir(dirname(__FILE__));
+echo 'PHP version: ' . PHP_VERSION . "\n";
+if (version_compare(PHP_VERSION, '7.4.0', '<')) {
+    echo "ERROR: PHP 7.4 or newer is required.\n";
+    $failed = true;
+}
 
-// Test 1: Check PHP version
-echo "1. PHP Version Check:\n";
-echo "   PHP Version: " . PHP_VERSION . "\n";
-if (version_compare(PHP_VERSION, '7.4.0', '>=')) {
-    echo "   ✅ PHP version is compatible\n";
+foreach (['json', 'openssl'] as $extension) {
+    $loaded = extension_loaded($extension);
+    echo ($loaded ? 'OK' : 'ERROR') . ": {$extension} extension\n";
+    $failed = $failed || !$loaded;
+}
+
+try {
+    $config = loadConfig();
+    echo "OK: configuration loaded from protected data directory\n";
+    echo (configuredApiToken($config) !== '' ? 'OK' : 'ERROR') . ": Cloudflare API token configured\n";
+    echo 'INFO: ' . count($config['domains']) . " domain(s) configured\n";
+    echo 'INFO: update interval is ' . $config['update_interval'] . "\n";
+    if (configuredApiToken($config) === '') {
+        $failed = true;
+    }
+} catch (Throwable $exception) {
+    echo 'ERROR: ' . $exception->getMessage() . "\n";
+    $failed = true;
+}
+
+foreach ([dataDirectory(), dataPath(CONFIG_FILE), __DIR__ . '/auto_update.php'] as $path) {
+    $readable = is_readable($path);
+    echo ($readable ? 'OK' : 'ERROR') . ": readable {$path}\n";
+    $failed = $failed || !$readable;
+}
+
+if (!is_writable(dataDirectory())) {
+    echo "ERROR: protected data directory is not writable\n";
+    $failed = true;
 } else {
-    echo "   ❌ PHP version too old (requires 7.4+)\n";
+    echo "OK: protected data directory is writable\n";
 }
-echo "\n";
 
-// Test 2: Check required extensions
-echo "2. PHP Extensions Check:\n";
-$required_extensions = ['json', 'curl', 'openssl'];
-foreach ($required_extensions as $ext) {
-    if (extension_loaded($ext)) {
-        echo "   ✅ $ext extension loaded\n";
-    } else {
-        echo "   ❌ $ext extension missing\n";
-    }
-}
-echo "\n";
-
-// Test 3: Check file permissions
-echo "3. File Permissions Check:\n";
-$files_to_check = [
-    'config.json' => 'Configuration file',
-    'auto_update.php' => 'Auto update script',
-    '.' => 'Current directory'
-];
-
-foreach ($files_to_check as $file => $description) {
-    if (file_exists($file)) {
-        $perms = substr(sprintf('%o', fileperms($file)), -4);
-        echo "   📁 $description ($file): $perms\n";
-        
-        if ($file === 'config.json') {
-            if (is_readable($file) && is_writable($file)) {
-                echo "      ✅ Readable and writable\n";
-            } else {
-                echo "      ❌ Permission issues\n";
-            }
-        }
-    } else {
-        echo "   ❌ $description ($file): Not found\n";
-    }
-}
-echo "\n";
-
-// Test 4: Check configuration
-echo "4. Configuration Check:\n";
-if (file_exists('config.json')) {
-    $config = json_decode(file_get_contents('config.json'), true);
-    
-    if ($config) {
-        echo "   ✅ Configuration file is valid JSON\n";
-        
-        // Check required fields
-        $required_fields = ['api_token', 'domains', 'update_interval'];
-        foreach ($required_fields as $field) {
-            if (isset($config[$field])) {
-                echo "   ✅ $field is configured\n";
-            } else {
-                echo "   ❌ $field is missing\n";
-            }
-        }
-        
-        // Check API token
-        if (!empty($config['api_token'])) {
-            echo "   ✅ API token is set\n";
-        } else {
-            echo "   ❌ API token is empty\n";
-        }
-        
-        // Check domains
-        if (isset($config['domains']) && is_array($config['domains'])) {
-            $domain_count = count($config['domains']);
-            echo "   📊 $domain_count domain(s) configured\n";
-            
-            $enabled_count = 0;
-            foreach ($config['domains'] as $domain) {
-                if (isset($domain['enabled']) && $domain['enabled']) {
-                    $enabled_count++;
-                }
-            }
-            echo "   📊 $enabled_count domain(s) enabled\n";
-        }
-        
-        // Check update interval
-        if (isset($config['update_interval'])) {
-            echo "   ⏰ Update interval: {$config['update_interval']}\n";
-        }
-        
-    } else {
-        echo "   ❌ Configuration file contains invalid JSON\n";
-    }
+$context = stream_context_create(['http' => ['timeout' => 10, 'max_redirects' => 0]]);
+$ip = @file_get_contents('https://api.ipify.org', false, $context, 0, 64);
+$ip = $ip === false ? '' : trim($ip);
+if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
+    echo "ERROR: public IPv4 detection failed\n";
+    $failed = true;
 } else {
-    echo "   ❌ Configuration file not found\n";
-}
-echo "\n";
-
-// Test 5: Check internet connectivity
-echo "5. Internet Connectivity Check:\n";
-$test_urls = [
-    'https://api.ipify.org' => 'IP detection service',
-    'https://api.cloudflare.com/client/v4/zones' => 'Cloudflare API'
-];
-
-foreach ($test_urls as $url => $description) {
-    $context = stream_context_create([
-        'http' => [
-            'timeout' => 10,
-            'user_agent' => 'CloudflareDynDNS-Test/1.0'
-        ]
-    ]);
-    
-    $result = @file_get_contents($url, false, $context);
-    if ($result !== false) {
-        echo "   ✅ $description accessible\n";
-    } else {
-        echo "   ❌ $description not accessible\n";
-    }
-}
-echo "\n";
-
-// Test 6: Test IP detection
-echo "6. IP Detection Test:\n";
-$ip_services = [
-    'https://api.ipify.org',
-    'https://ipv4.icanhazip.com',
-    'https://checkip.amazonaws.com'
-];
-
-$detected_ips = [];
-foreach ($ip_services as $service) {
-    $ip = @file_get_contents($service);
-    if ($ip && filter_var(trim($ip), FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-        $ip = trim($ip);
-        $detected_ips[] = $ip;
-        echo "   ✅ $service: $ip\n";
-    } else {
-        echo "   ❌ $service: Failed\n";
-    }
+    echo "OK: public IPv4 detection works\n";
 }
 
-if (!empty($detected_ips)) {
-    $unique_ips = array_unique($detected_ips);
-    if (count($unique_ips) === 1) {
-        echo "   ✅ All services report same IP: {$unique_ips[0]}\n";
-    } else {
-        echo "   ⚠️  Services report different IPs: " . implode(', ', $unique_ips) . "\n";
-    }
-}
-echo "\n";
+echo "\nSuggested cron command:\n";
+echo '* * * * * ' . escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg(__DIR__ . '/auto_update.php') . "\n";
+echo "The script enforces the configured interval internally.\n";
 
-// Test 7: Simulate cron execution
-echo "7. Cron Simulation Test:\n";
-if (file_exists('auto_update.php')) {
-    echo "   🔄 Testing auto_update.php execution...\n";
-    
-    // Capture output
-    ob_start();
-    $exit_code = 0;
-    
-    try {
-        // Include the auto_update script
-        include 'auto_update.php';
-    } catch (Exception $e) {
-        echo "   ❌ Exception: " . $e->getMessage() . "\n";
-        $exit_code = 1;
-    }
-    
-    $output = ob_get_clean();
-    
-    if ($output) {
-        echo "   📝 Script output:\n";
-        $lines = explode("\n", trim($output));
-        foreach ($lines as $line) {
-            if (!empty($line)) {
-                echo "      $line\n";
-            }
-        }
-    }
-    
-    if ($exit_code === 0) {
-        echo "   ✅ Script executed successfully\n";
-    } else {
-        echo "   ❌ Script execution failed\n";
-    }
-} else {
-    echo "   ❌ auto_update.php not found\n";
-}
-echo "\n";
-
-// Test 8: Cron command generation
-echo "8. Cron Command Test:\n";
-if (file_exists('config.json')) {
-    $config = json_decode(file_get_contents('config.json'), true);
-    if ($config && isset($config['update_interval']) && $config['update_interval'] !== 'manual') {
-        $php_path = PHP_BINARY;
-        $script_path = realpath('auto_update.php');
-        
-        $intervals = [
-            '5min' => '*/5 * * * *',
-            '15min' => '*/15 * * * *',
-            '30min' => '*/30 * * * *',
-            '1hour' => '0 * * * *',
-            '6hours' => '0 */6 * * *',
-            '12hours' => '0 */12 * * *',
-            'daily' => '0 0 * * *'
-        ];
-        
-        $interval = $config['update_interval'];
-        if (isset($intervals[$interval])) {
-            $cron_schedule = $intervals[$interval];
-            echo "   📋 Suggested cron command:\n";
-            echo "   $cron_schedule $php_path $script_path\n";
-            echo "\n";
-            echo "   💡 To install:\n";
-            echo "   1. Run: crontab -e\n";
-            echo "   2. Add the line above\n";
-            echo "   3. Save and exit\n";
-        } else {
-            echo "   ❌ Unknown update interval: $interval\n";
-        }
-    } else {
-        echo "   ℹ️  Automatic updates disabled (manual mode)\n";
-    }
-} else {
-    echo "   ❌ Cannot generate cron command without configuration\n";
-}
-
-echo "\n=== Test Complete ===\n";
-echo "If all tests pass, your cron setup should work correctly!\n";
-?>
+exit($failed ? 1 : 0);
