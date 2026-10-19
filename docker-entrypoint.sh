@@ -9,7 +9,7 @@ chmod 0700 "$data_dir"
 # Initialize credentials before Apache accepts connections. A random password is
 # generated unless DYNDNS_INITIAL_PASSWORD (12+ characters) was supplied.
 runuser -u www-data -- php -r "require '/var/www/html/bootstrap.php'; loadConfig();"
-if [ -f "$data_dir/initial_password.txt" ]; then
+if [ -f "$data_dir/initial_password.txt" ] && mkdir -m 0700 "$data_dir/.initial_password_announced" 2>/dev/null; then
   echo "Generated initial panel password (change it after login):"
   sed -n '1p' "$data_dir/initial_password.txt"
 fi
