@@ -1,126 +1,85 @@
 <?php
-session_start();
+declare(strict_types=1);
 
-// Check if user is logged in
-if (!isset($_SESSION['logged_in'])) {
-    http_response_code(403);
-    echo json_encode(['success' => false, 'error' => 'Not logged in']);
-    exit;
-}
+require_once __DIR__ . '/bootstrap.php';
+require_once __DIR__ . '/cloudflare_api.php';
 
-// Load configuration
-function loadConfig() {
-    if (!file_exists('config.json')) {
-        return ['api_token' => ''];
-    }
-    return json_decode(file_get_contents('config.json'), true);
-}
+startSecureSession();
+requireLogin(true);
+header('Content-Type: application/json; charset=utf-8');
 
 $config = loadConfig();
-
-if (empty($config['api_token'])) {
+requirePasswordChangeComplete($config, true);
+$apiToken = configuredApiToken($config);
+if ($apiToken === '') {
     echo json_encode(['success' => false, 'error' => 'No API token configured']);
     exit;
 }
 
-$action = $_GET['action'] ?? '';
+$action = isset($_GET['action']) ? (string) $_GET['action'] : '';
+if ($action === 'get_zones') {
+    $response = cloudflareRequest('GET', '/zones?per_page=50', $apiToken);
+    if (empty($response['success']) || !isset($response['result']) || !is_array($response['result'])) {
+        echo json_encode(['success' => false, 'error' => cloudflareErrors($response)]);
+        exit;
+    }
 
-switch ($action) {
-    case 'get_zones':
-        getZones($config['api_token']);
-        break;
-        
-    case 'get_records':
-        $zoneId = $_GET['zone_id'] ?? '';
-        if (empty($zoneId)) {
-            echo json_encode(['success' => false, 'error' => 'Zone ID missing']);
-            exit;
+    $zones = [];
+    foreach ($response['result'] as $zone) {
+        if (is_array($zone)
+            && isset($zone['id'], $zone['name'])
+            && is_string($zone['id'])
+            && is_string($zone['name'])
+            && validateCloudflareId($zone['id'])
+            && validateDomainName($zone['name'])) {
+            $zones[] = ['id' => $zone['id'], 'name' => $zone['name']];
         }
-        getRecords($config['api_token'], $zoneId);
-        break;
-        
-    default:
-        echo json_encode(['success' => false, 'error' => 'Unknown action']);
-        break;
+    }
+    usort($zones, static function (array $left, array $right): int {
+        return strcmp($left['name'], $right['name']);
+    });
+    echo json_encode(['success' => true, 'zones' => $zones]);
+    exit;
 }
 
-function getZones($apiToken) {
-    $url = "https://api.cloudflare.com/client/v4/zones";
-    $options = [
-        "http" => [
-            "header" => [
-                "Authorization: Bearer $apiToken",
-                "Content-Type: application/json"
-            ],
-            "method" => "GET"
-        ]
-    ];
-    
-    $context = stream_context_create($options);
-    $result = @file_get_contents($url, false, $context);
-    
-    if (!$result) {
-        echo json_encode(['success' => false, 'error' => 'Network error while fetching zones']);
-        return;
+if ($action === 'get_records') {
+    $zoneId = isset($_GET['zone_id']) ? trim((string) $_GET['zone_id']) : '';
+    if (!validateCloudflareId($zoneId)) {
+        http_response_code(400);
+        echo json_encode(['success' => false, 'error' => 'Invalid Zone ID']);
+        exit;
     }
-    
-    $response = json_decode($result, true);
-    
-    if (!$response['success']) {
-        $errors = isset($response['errors']) ? array_column($response['errors'], 'message') : ['Unknown error'];
-        echo json_encode(['success' => false, 'error' => implode(', ', $errors)]);
-        return;
+
+    $response = cloudflareRequest('GET', '/zones/' . rawurlencode($zoneId) . '/dns_records?type=A&per_page=100', $apiToken);
+    if (empty($response['success']) || !isset($response['result']) || !is_array($response['result'])) {
+        echo json_encode(['success' => false, 'error' => cloudflareErrors($response)]);
+        exit;
     }
-    
-    // Sort zones by name
-    $zones = $response['result'];
-    usort($zones, function($a, $b) {
-        return strcmp($a['name'], $b['name']);
+
+    $records = [];
+    foreach ($response['result'] as $record) {
+        if (is_array($record)
+            && isset($record['id'], $record['name'], $record['content'])
+            && is_string($record['id'])
+            && is_string($record['name'])
+            && is_string($record['content'])
+            && validateCloudflareId($record['id'])
+            && validateDomainName($record['name'])
+            && filter_var($record['content'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false) {
+            $records[] = [
+                'id' => $record['id'],
+                'name' => $record['name'],
+                'content' => $record['content'],
+                'proxied' => !empty($record['proxied']),
+            ];
+        }
+    }
+    usort($records, static function (array $left, array $right): int {
+        return strcmp($left['name'], $right['name']);
     });
-    
-    echo json_encode([
-        'success' => true,
-        'zones' => $zones
-    ]);
+    echo json_encode(['success' => true, 'records' => $records]);
+    exit;
 }
 
-function getRecords($apiToken, $zoneId) {
-    $url = "https://api.cloudflare.com/client/v4/zones/$zoneId/dns_records?type=A";
-    $options = [
-        "http" => [
-            "header" => [
-                "Authorization: Bearer $apiToken",
-                "Content-Type: application/json"
-            ],
-            "method" => "GET"
-        ]
-    ];
-    
-    $context = stream_context_create($options);
-    $result = @file_get_contents($url, false, $context);
-    
-    if (!$result) {
-        echo json_encode(['success' => false, 'error' => 'Network error while fetching records']);
-        return;
-    }
-    
-    $response = json_decode($result, true);
-    
-    if (!$response['success']) {
-        $errors = isset($response['errors']) ? array_column($response['errors'], 'message') : ['Unknown error'];
-        echo json_encode(['success' => false, 'error' => implode(', ', $errors)]);
-        return;
-    }
-    
-    // Sort records by name
-    $records = $response['result'];
-    usort($records, function($a, $b) {
-        return strcmp($a['name'], $b['name']);
-    });
-    
-    echo json_encode([
-        'success' => true,
-        'records' => $records
-    ]);
-}
-?>
+http_response_code(400);
+echo json_encode(['success' => false, 'error' => 'Unknown action']);

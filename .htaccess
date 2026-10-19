@@ -1,0 +1,5 @@
+Options -Indexes
+
+<FilesMatch "(?i)^(?:\..*|config\.json|update_log\.json|last_(?:ip|run)\.txt|initial_password\.txt|bootstrap\.php|cloudflare_api\.php|auto_update\.php|test_cron\.php)$">
+    Require all denied
+</FilesMatch>

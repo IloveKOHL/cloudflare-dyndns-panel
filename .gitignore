@@ -1,1 +1,8 @@
 config.json
+update_log.json
+last_ip.txt
+last_run.txt
+initial_password.txt
+data/
+.test-data/
+.test-tools/

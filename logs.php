@@ -1,26 +1,29 @@
 <?php
-session_start();
-if (!isset($_SESSION['logged_in'])) {
-    die("Not logged in!");
-}
+declare(strict_types=1);
 
-// Load update logs
-function loadLogs() {
-    if (!file_exists('update_log.json')) {
-        return [];
-    }
-    return json_decode(file_get_contents('update_log.json'), true) ?: [];
-}
+require_once __DIR__ . '/bootstrap.php';
+
+startSecureSession();
+requireLogin();
+$cspNonce = cspNonce();
 
 // Clear logs
-if (isset($_GET['clear']) && isset($_SESSION['logged_in'])) {
-    if (file_exists('update_log.json')) {
-        unlink('update_log.json');
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['clear'])) {
+    if (!verifyCsrfToken($_POST['csrf_token'] ?? null)) {
+        http_response_code(400);
+        exit('Invalid request');
     }
-    header("Location: logs.php");
+    if (!clearLogs()) {
+        http_response_code(500);
+        exit('Unable to clear logs');
+    }
+    header('Location: logs.php');
     exit;
 }
 
+csrfToken();
+$config = loadConfig();
+requirePasswordChangeComplete($config);
 $logs = loadLogs();
 $page = isset($_GET['page']) ? max(1, intval($_GET['page'])) : 1;
 $perPage = 20;
@@ -233,7 +236,10 @@ $pagedLogs = array_slice($logs, $offset, $perPage);
             <div>
                 <a href="index.php" class="btn btn-small">← Back to Dashboard</a>
                 <?php if (!empty($logs)): ?>
-                    <a href="?clear=1" class="btn btn-small btn-danger" onclick="return confirm('Really clear all logs?')">🗑️ Clear Logs</a>
+                    <form method="POST" id="clear-logs-form" style="display: inline;">
+                        <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
+                        <button type="submit" name="clear" class="btn btn-small btn-danger">🗑️ Clear Logs</button>
+                    </form>
                 <?php endif; ?>
             </div>
         </div>
@@ -324,5 +330,15 @@ $pagedLogs = array_slice($logs, $offset, $perPage);
             </div>
         <?php endif; ?>
     </div>
+    <script nonce="<?= htmlspecialchars($cspNonce, ENT_QUOTES, 'UTF-8') ?>">
+        const clearForm = document.getElementById('clear-logs-form');
+        if (clearForm) {
+            clearForm.addEventListener('submit', event => {
+                if (!window.confirm('Really clear all logs?')) {
+                    event.preventDefault();
+                }
+            });
+        }
+    </script>
 </body>
 </html>

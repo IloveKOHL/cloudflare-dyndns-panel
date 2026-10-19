@@ -1,23 +1,13 @@
 <?php
-session_start();
-if (!isset($_SESSION['logged_in'])) {
-    die("Not logged in!");
-}
+declare(strict_types=1);
 
-// Load configuration
-function loadConfig() {
-    if (!file_exists('config.json')) {
-        return ['api_token' => '', 'domains' => []];
-    }
-    return json_decode(file_get_contents('config.json'), true);
-}
+require_once __DIR__ . '/bootstrap.php';
 
-// Save configuration
-function saveConfig($config) {
-    return file_put_contents('config.json', json_encode($config, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-}
+startSecureSession();
+requireLogin();
 
 $config = loadConfig();
+requirePasswordChangeComplete($config);
 $error = '';
 $success = '';
 $domain = null;
@@ -28,11 +18,15 @@ if (!isset($_GET['id'])) {
     exit;
 }
 
-$domainId = $_GET['id'];
+$domainId = (string) $_GET['id'];
+if (!preg_match('/^[a-f0-9]{13,32}$/i', $domainId)) {
+    http_response_code(400);
+    exit('Invalid domain ID');
+}
 
 // Find the domain in the config
 foreach ($config['domains'] as $key => $d) {
-    if ($d['id'] === $domainId) {
+    if (isset($d['id']) && is_string($d['id']) && hash_equals($d['id'], $domainId)) {
         $domain = $d;
         $domainIndex = $key;
         break;
@@ -48,29 +42,25 @@ if (!$domain) {
 // Handle form submission
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_domain'])) {
     // CSRF protection
-    if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+    if (!verifyCsrfToken($_POST['csrf_token'] ?? null)) {
         $error = "Invalid request";
     } else {
-        // Update domain data
-        $config['domains'][$domainIndex]['zone_id'] = trim($_POST['zone_id']);
-        $config['domains'][$domainIndex]['record_id'] = trim($_POST['record_id']);
-        $config['domains'][$domainIndex]['name'] = trim($_POST['domain_name']);
-        $config['domains'][$domainIndex]['proxied'] = isset($_POST['proxied']);
-        
-        if (saveConfig($config)) {
-            $success = "Domain updated successfully!";
-            // Refresh domain data
-            $domain = $config['domains'][$domainIndex];
-        } else {
-            $error = "Error updating domain";
+        try {
+            $validated = validatedDomainInput($_POST);
+            $config['domains'][$domainIndex] = array_merge($config['domains'][$domainIndex], $validated);
+            if (saveConfig($config)) {
+                $success = "Domain updated successfully!";
+                $domain = $config['domains'][$domainIndex];
+            } else {
+                $error = "Error updating domain";
+            }
+        } catch (InvalidArgumentException $exception) {
+            $error = $exception->getMessage();
         }
     }
 }
 
-// Generate CSRF token if not exists
-if (!isset($_SESSION['csrf_token'])) {
-    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-}
+csrfToken();
 ?>
 
 <!DOCTYPE html>
@@ -280,24 +270,24 @@ if (!isset($_SESSION['csrf_token'])) {
         </div>
 
         <form method="POST">
-            <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
             
             <div class="form-group">
                 <label for="zone_id">Zone ID</label>
                 <input type="text" id="zone_id" name="zone_id" 
-                       value="<?= htmlspecialchars($domain['zone_id']) ?>" required>
+                       value="<?= htmlspecialchars($domain['zone_id'], ENT_QUOTES, 'UTF-8') ?>" required>
             </div>
 
             <div class="form-group">
                 <label for="record_id">Record ID</label>
                 <input type="text" id="record_id" name="record_id" 
-                       value="<?= htmlspecialchars($domain['record_id']) ?>" required>
+                       value="<?= htmlspecialchars($domain['record_id'], ENT_QUOTES, 'UTF-8') ?>" required>
             </div>
 
             <div class="form-group">
                 <label for="domain_name">Domain Name</label>
                 <input type="text" id="domain_name" name="domain_name" 
-                       value="<?= htmlspecialchars($domain['name']) ?>" required>
+                       value="<?= htmlspecialchars($domain['name'], ENT_QUOTES, 'UTF-8') ?>" required>
             </div>
 
             <div class="form-group">
